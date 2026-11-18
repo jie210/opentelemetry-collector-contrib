@@ -41,8 +41,10 @@ type Config struct {
 	MaxInflightRecords int
 	// MaxInflightBytes bounds the raw bytes of those records.
 	MaxInflightBytes int64
-	// MemoCapacity bounds the decisions restored after a restart.
-	MemoCapacity int
+	// KeepMemo and DropMemo bound the keep and drop decisions restored after
+	// a restart.
+	KeepMemo int
+	DropMemo int
 }
 
 type assocState uint8
@@ -215,35 +217,47 @@ func (s *Spool) Decide(id pcommon.TraceID, keep bool) {
 	if keep {
 		kind = frameKeep
 	}
+	s.logBeyondWatermarkLocked(id, keep)
 	s.appendLocked(&frame{kind: kind, seq: s.wm, id: id})
 	s.memo.put(id, keep)
 	s.settlePendingLocked(id, keep)
 }
 
-// Evict ends the trace's pending instance without a decision; its spans are
+// Evict ends the trace's instance without a decision; its pending spans are
 // dropped, as the in-memory processor does when it removes a trace for
-// capacity.
+// capacity, and a decision it still held is forgotten.
 func (s *Spool) Evict(id pcommon.TraceID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.logBeyondWatermarkLocked(id, false)
 	s.appendLocked(&frame{kind: frameEvict, seq: s.wm, id: id})
 	s.memo.remove(id)
 	s.stats.Evicted++
 	s.settlePendingLocked(id, false)
 }
 
-// Forget removes a decided trace from the restart memo.
-func (s *Spool) Forget(id pcommon.TraceID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.memo.remove(id)
+// logBeyondWatermarkLocked logs the settlement of associations attached in
+// the record being processed, which replay does not attach by watermark.
+func (s *Spool) logBeyondWatermarkLocked(id pcommon.TraceID, keep bool) {
+	for _, ref := range s.pending[id] {
+		if ref.rec.seq > s.wm {
+			s.appendLocked(&frame{kind: frameLate, seq: ref.rec.seq, id: id, keep: keep})
+		}
+	}
 }
 
 // Begin marks r as the record whose fragments the processor is handling.
-// Decisions logged from now on cover the associations already attached in
-// records up to r; replay attaches the rest of r's associations as pending
-// unless a later frame settles them.
+// Records must be processed in sequence order. Decision frames carry the
+// watermark of fully processed records, and replay attaches their unsettled
+// associations to the pending instance of each trace.
 func (s *Spool) Begin(r *Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wm = max(s.wm, r.seq-1)
+}
+
+// End marks every fragment of r as processed.
+func (s *Spool) End(r *Record) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.wm = max(s.wm, r.seq)
@@ -329,10 +343,11 @@ func (s *Spool) releaseLocked(r *Record) {
 	}
 }
 
-// memo keeps the most recent decisions in decision order.
+// memo keeps the most recent keep and drop decisions in decision order, each
+// bounded separately like the processor's two decision caches.
 type memo struct {
-	capacity int
-	order    *list.List
+	capacity [2]int
+	order    [2]*list.List
 	byID     map[pcommon.TraceID]*list.Element
 }
 
@@ -341,38 +356,51 @@ type memoEntry struct {
 	Keep bool
 }
 
-func newMemo(capacity int) *memo {
-	return &memo{capacity: capacity, order: list.New(), byID: map[pcommon.TraceID]*list.Element{}}
+func side(keep bool) int {
+	if keep {
+		return 1
+	}
+	return 0
+}
+
+func newMemo(keepCapacity, dropCapacity int) *memo {
+	return &memo{
+		capacity: [2]int{dropCapacity, keepCapacity},
+		order:    [2]*list.List{list.New(), list.New()},
+		byID:     map[pcommon.TraceID]*list.Element{},
+	}
 }
 
 func (m *memo) put(id pcommon.TraceID, keep bool) {
-	if m.capacity <= 0 {
+	m.remove(id)
+	i := side(keep)
+	if m.capacity[i] <= 0 {
 		return
 	}
-	if e, ok := m.byID[id]; ok {
-		e.Value = memoEntry{ID: id, Keep: keep}
-		m.order.MoveToBack(e)
-		return
-	}
-	m.byID[id] = m.order.PushBack(memoEntry{ID: id, Keep: keep})
-	for m.order.Len() > m.capacity {
-		front := m.order.Front()
+	order := m.order[i]
+	m.byID[id] = order.PushBack(memoEntry{ID: id, Keep: keep})
+	for order.Len() > m.capacity[i] {
+		front := order.Front()
 		delete(m.byID, front.Value.(memoEntry).ID)
-		m.order.Remove(front)
+		order.Remove(front)
 	}
 }
 
 func (m *memo) remove(id pcommon.TraceID) {
 	if e, ok := m.byID[id]; ok {
 		delete(m.byID, id)
-		m.order.Remove(e)
+		m.order[side(e.Value.(memoEntry).Keep)].Remove(e)
 	}
 }
 
+// entries returns the drop decisions and then the keep decisions, each
+// oldest first.
 func (m *memo) entries() []memoEntry {
-	out := make([]memoEntry, 0, m.order.Len())
-	for e := m.order.Front(); e != nil; e = e.Next() {
-		out = append(out, e.Value.(memoEntry))
+	out := make([]memoEntry, 0, len(m.byID))
+	for _, order := range m.order {
+		for e := order.Front(); e != nil; e = e.Next() {
+			out = append(out, e.Value.(memoEntry))
+		}
 	}
 	return out
 }

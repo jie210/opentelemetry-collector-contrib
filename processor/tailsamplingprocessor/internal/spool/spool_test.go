@@ -57,6 +57,7 @@ func (m *modelSampler) process(r *Record, ids map[pcommon.TraceID]int) {
 		m.s.Attach(r, i)
 		m.pending[id] = true
 	}
+	m.s.End(r)
 }
 
 func (m *modelSampler) tick(r *rand.Rand) {
@@ -77,7 +78,8 @@ func testConfig(dir string) Config {
 		CheckpointBytes:    8 << 10,
 		MaxInflightRecords: 2,
 		MaxInflightBytes:   1 << 20,
-		MemoCapacity:       1 << 20,
+		KeepMemo:           1 << 20,
+		DropMemo:           1 << 20,
 	}
 }
 
@@ -193,6 +195,127 @@ func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
 			}
 		}
 		sink.mu.Unlock()
+	}
+}
+
+// snapshot returns the settlement of every live association, with pending
+// and unsettled reported as unsettled, and the memo without IDs that have a
+// pending instance.
+func snapshot(s *Spool) (map[uint64][]assocState, []memoEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	states := map[uint64][]assocState{}
+	open := map[pcommon.TraceID]bool{}
+	for seq, r := range s.records {
+		st := make([]assocState, len(r.state))
+		for i, a := range r.state {
+			st[i] = a
+			if a == pending || a == unsettled {
+				st[i] = unsettled
+				open[r.ids[i]] = true
+			}
+		}
+		states[seq] = st
+	}
+	var memo []memoEntry
+	for _, e := range s.memo.entries() {
+		if !open[e.ID] {
+			memo = append(memo, e)
+		}
+	}
+	return states, memo
+}
+
+func TestReplayMatchesRuntimeState(t *testing.T) {
+	for seed := range uint64(30) {
+		r := rand.New(rand.NewPCG(seed, 7))
+		dir := t.TempDir()
+		cfg := testConfig(dir)
+		cfg.KeepMemo, cfg.DropMemo = 8, 5
+		sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+		s, _, err := Open(cfg, zap.NewNop(), sink)
+		require.NoError(t, err)
+		m := &modelSampler{s: s, pending: map[pcommon.TraceID]bool{}, decided: map[pcommon.TraceID]bool{}}
+
+		// process handles a record like the processor does, with capacity
+		// evictions and size-limit drops in the middle of the record.
+		process := func(rec *Record, ids map[pcommon.TraceID]int) {
+			s.Begin(rec)
+			for i, id := range rec.ids {
+				if _, ok := ids[id]; !ok {
+					continue
+				}
+				if r.IntN(8) == 0 && len(m.pending) > 0 {
+					for victim := range m.pending {
+						s.Evict(victim)
+						delete(m.pending, victim)
+						break
+					}
+				}
+				if keep, ok := m.decided[id]; ok {
+					s.Inherit(rec, i, keep)
+					continue
+				}
+				s.Attach(rec, i)
+				m.pending[id] = true
+				if r.IntN(10) == 0 {
+					s.Decide(id, false)
+					m.decided[id] = false
+					delete(m.pending, id)
+				}
+			}
+			s.End(rec)
+		}
+
+		traces := make([]pcommon.TraceID, 12)
+		for i := range traces {
+			traces[i][0] = byte(i)
+		}
+		var next uint64
+		for step := range 300 {
+			td, ids := makeRequest(r, traces, &next)
+			var u ptrace.ProtoMarshaler
+			raw, err := u.MarshalTraces(td)
+			require.NoError(t, err)
+			rec, err := s.Register(raw, ids, time.Now())
+			require.NoError(t, err)
+			all := map[pcommon.TraceID]int{}
+			for i, id := range ids {
+				all[id] = i
+			}
+			process(rec, all)
+			if r.IntN(3) == 0 {
+				m.tick(r)
+			}
+			if r.IntN(5) == 0 {
+				// Forget decisions like an LRU eviction would.
+				for id := range m.decided {
+					if r.IntN(3) == 0 {
+						delete(m.decided, id)
+					}
+				}
+			}
+			if step%41 == 40 {
+				s.Flush()
+				wantStates, wantMemo := snapshot(s)
+				crash(s)
+				var got *Recovered
+				s, got, err = Open(cfg, zap.NewNop(), sink)
+				require.NoError(t, err)
+				gotStates, gotMemo := snapshot(s)
+				require.Equal(t, wantStates, gotStates, "seed %d step %d", seed, step)
+				require.Equal(t, wantMemo, gotMemo, "seed %d step %d", seed, step)
+
+				m = &modelSampler{s: s, pending: map[pcommon.TraceID]bool{}, decided: map[pcommon.TraceID]bool{}}
+				for _, e := range got.Memo {
+					m.decided[e.ID] = e.Keep
+				}
+				for _, rr := range got.Refeed {
+					process(rr.Record, rr.IDs)
+				}
+			}
+		}
+		require.NoError(t, s.Stop())
 	}
 }
 

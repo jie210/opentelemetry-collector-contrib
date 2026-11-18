@@ -115,7 +115,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		segs:    map[uint32]*segment{},
 		records: map[uint64]*Record{},
 		pending: map[pcommon.TraceID][]assocRef{},
-		memo:    newMemo(cfg.MemoCapacity),
+		memo:    newMemo(cfg.KeepMemo, cfg.DropMemo),
 		nextSeq: 1,
 	}
 	s.readyCond = sync.NewCond(&s.mu)
@@ -287,6 +287,11 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 		if len(ids) > 0 {
 			rec.Refeed = append(rec.Refeed, RefeedRecord{Record: r, IDs: ids})
 		}
+	}
+	// Records to refeed count as unprocessed again.
+	s.wm = s.nextSeq - 1
+	if len(rec.Refeed) > 0 {
+		s.wm = rec.Refeed[0].Record.seq - 1
 	}
 
 	var maxID uint32
