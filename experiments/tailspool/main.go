@@ -5,7 +5,7 @@ package main
 
 import (
 	"bufio"
-	"cmp"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"slices"
+
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -115,6 +115,12 @@ func run(mode, dir string) error {
 	return runAt(mode, dir, "127.0.0.1:14317", "127.0.0.1:18888")
 }
 
+func listenRPC(addr string, h endpoint) (*grpc.Server, net.Listener, error) {
+	g := grpc.NewServer(grpc.ForceServerCodec(wireCodec{}))
+	g.RegisterService(&grpc.ServiceDesc{ServiceName: "opentelemetry.proto.collector.trace.v1.TraceService", HandlerType: (*any)(nil), Methods: []grpc.MethodDesc{{MethodName: "Export", Handler: export}}}, h)
+	l, e := net.Listen("tcp", addr)
+	return g, l, e
+}
 func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	ctx := context.Background()
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -145,6 +151,39 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	h := host{componenttest.NewNopHost(), make(map[component.ID]component.Component)}
 	var sp *spool
 	var restored map[traceID]bool
+	var gate startupGate
+	var g *grpc.Server
+	var l net.Listener
+	errs := make(chan error, 2)
+	if mode == "compact" {
+		lock, e := os.Open(dir)
+		if e != nil {
+			return e
+		}
+		defer lock.Close()
+		if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
+			return e
+		}
+		for _, pattern := range []string{".checkpoint-*", "*.inbox.part"} {
+			files, e := filepath.Glob(filepath.Join(dir, pattern))
+			if e != nil {
+				return e
+			}
+			for _, p := range files {
+				if e = os.Remove(p); e != nil {
+					return e
+				}
+			}
+		}
+		yes, no = newDecisionLRU(), newDecisionLRU()
+		gate.dir = dir
+		g, l, err = listenRPC(rpcAddr, gate.consume)
+		if err != nil {
+			return err
+		}
+		defer g.Stop()
+		go func() { errs <- g.Serve(l) }()
+	}
 	var single *observedSingle
 	var multi *observedMulti
 	var decided, accepted, requests atomic.Int64
@@ -166,7 +205,8 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 			if err != nil {
 				return err
 			}
-			defer sp.journal.f.Close()
+			defer func() { sp.journal.f.Close() }()
+			sp.recovering = restored
 		}
 		yes = observedCache{yes, sp, true}
 		no = observedCache{no, sp, false}
@@ -211,41 +251,6 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		return err
 	}
 	restoreCount := len(restored)
-	if restoreCount > 0 {
-		// Spread recovered IDs across decision buckets so a restart does not
-		// make an entire 30-second workload expire in a single tick.
-		start := time.Now()
-		n := 0
-		td := ptrace.NewTraces()
-		spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
-		type item struct {
-			id      traceID
-			seq     uint64
-			isError bool
-		}
-		items := make([]item, 0, restoreCount)
-		for id, e := range restored {
-			items = append(items, item{id, sp.index[id][0].seq, e})
-		}
-		restored = nil
-		slices.SortFunc(items, func(a, b item) int { return cmp.Compare(a.seq, b.seq) })
-		for _, entry := range items {
-			statusSpan(spans, entry.id, entry.isError)
-			n++
-			if n%256 == 0 || n == restoreCount {
-				if err = sampler.ConsumeTraces(ctx, td); err != nil {
-					return err
-				}
-				td = ptrace.NewTraces()
-				spans = td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
-				if restoreCount > 8192 {
-					time.Sleep(time.Until(start.Add(time.Duration(int64(*decisionWait) * int64(n) / int64(restoreCount)))))
-				}
-			}
-		}
-		restored = nil
-	}
-	g := grpc.NewServer(grpc.ForceServerCodec(wireCodec{}))
 	handler := endpoint(func(ctx context.Context, raw []byte) error {
 		td, err := (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces(raw)
 		if err != nil {
@@ -254,7 +259,12 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		n := td.SpanCount()
 		if sp != nil {
 			summary, ids := projection(td)
-			if err = sp.append(raw, ids); err != nil {
+			if mode == "compact" {
+				err = sp.ingest(raw, ids, summary)
+			} else {
+				err = sp.append(raw, ids)
+			}
+			if err != nil {
 				return err
 			}
 			td = summary
@@ -266,10 +276,26 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		requests.Add(1)
 		return nil
 	})
-	g.RegisterService(&grpc.ServiceDesc{ServiceName: "opentelemetry.proto.collector.trace.v1.TraceService", HandlerType: (*any)(nil), Methods: []grpc.MethodDesc{{MethodName: "Export", Handler: export}}}, handler)
-	l, err := net.Listen("tcp", rpcAddr)
-	if err != nil {
-		return err
+	var stopRecovery context.CancelFunc
+	var recoveryDone chan struct{}
+	if mode == "compact" {
+		n, k, e := gate.activate(sp, handler)
+		if e != nil {
+			return e
+		}
+		accepted.Add(int64(n))
+		requests.Add(int64(k))
+		items := sp.schedule()
+		var rctx context.Context
+		rctx, stopRecovery = context.WithCancel(ctx)
+		recoveryDone = make(chan struct{})
+		go func() { defer close(recoveryDone); sp.expire(rctx, items) }()
+	} else {
+		g, l, err = listenRPC(rpcAddr, handler)
+		if err != nil {
+			return err
+		}
+		go func() { errs <- g.Serve(l) }()
 	}
 	m, err := net.Listen("tcp", statsAddr)
 	if err != nil {
@@ -294,6 +320,13 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		}
 		if sp != nil {
 			sp.mu.Lock()
+			if sp.journal != nil {
+				stats["staged"] = gate.staged
+				stats["recovering"] = len(sp.recovering)
+				stats["recovered_decisions"] = sp.restoredDone
+				stats["max_recovery_lag_ms"] = sp.maxLateness / 1e6
+				stats["checkpoints"] = sp.journal.checkpoints
+			}
 			stats["appends"] = sp.appends
 			stats["written"] = sp.written
 			stats["reads"] = sp.reads
@@ -317,15 +350,19 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	})
 	signals, cancel := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
 	defer cancel()
-	errs := make(chan error, 2)
+
 	web := http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
 	go func() { errs <- web.Serve(m) }()
-	go func() { errs <- g.Serve(l) }()
+
 	select {
 	case <-signals.Done():
 	case err = <-errs:
 	}
 	g.GracefulStop()
+	if stopRecovery != nil {
+		stopRecovery()
+		<-recoveryDone
+	}
 	stopErr := sampler.Shutdown(ctx)
 	_ = web.Close()
 	if sp != nil && sp.current != nil {

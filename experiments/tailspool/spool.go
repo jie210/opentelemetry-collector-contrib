@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -24,6 +25,8 @@ type segment struct {
 }
 type record struct {
 	seq             uint64
+	due, inbox      int64
+	fields          []byte
 	seg             *segment
 	offset          int64
 	length, pending int
@@ -31,6 +34,9 @@ type record struct {
 }
 type spool struct {
 	journal                       *journal
+	recovering                    map[traceID]bool
+	restoredDone                  int64
+	maxLateness                   int64
 	mu                            sync.Mutex
 	dir                           string
 	limit                         int64
@@ -72,6 +78,9 @@ func projection(td ptrace.Traces) (ptrace.Traces, map[traceID]bool) {
 func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.appendLocked(raw, ids)
+}
+func (s *spool) appendLocked(raw []byte, ids map[traceID]bool) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -100,7 +109,7 @@ func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 		}
 	}
 	g := s.current
-	r := &record{seg: g, offset: g.size, length: len(raw)}
+	r := &record{due: time.Now().Add(*decisionWait).UnixNano(), seg: g, offset: g.size, length: len(raw)}
 	n, err := g.file.Write(raw)
 	g.size += int64(n)
 	if err != nil || n != len(raw) {
@@ -123,6 +132,9 @@ func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 	}
 	if r.pending == 0 {
 		s.finish(r)
+	}
+	if s.err == nil && s.journal != nil && *checkpointBytes > 0 && s.journal.delta >= *checkpointBytes {
+		s.err = s.checkpoint()
 	}
 	return s.err
 }

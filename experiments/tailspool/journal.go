@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
 )
@@ -22,16 +23,21 @@ import (
 // Single writer under spool.mu. Frames order registrations, decisions and sink
 // commits. A flushed frame and the earlier raw Write survive a process SIGKILL.
 type journal struct {
-	f      *os.File
-	w      *bufio.Writer
-	audit  *audit
-	replay bool
-	seq    uint64
+	f           *os.File
+	w           *bufio.Writer
+	audit       *audit
+	replay      bool
+	seq         uint64
+	live        map[uint64]*record
+	adopted     map[int64]bool
+	delta       int64
+	checkpoints int64
 }
 
 var le = binary.LittleEndian
 
 func (j *journal) frame(b []byte) error {
+	j.delta += int64(len(b) + 8)
 	var hdr [8]byte
 	le.PutUint32(hdr[:4], uint32(len(b)))
 	le.PutUint32(hdr[4:], crc32.ChecksumIEEE(b))
@@ -45,7 +51,10 @@ func (j *journal) appendRecord(s *spool, r *record, ids map[traceID]bool) error 
 	j.seq++
 	r.seq = j.seq
 	b := make([]byte, 0, 17+17*len(ids))
-	b = append(b, 'R')
+	b = append(b, 'T')
+	b = le.AppendUint64(b, r.seq)
+	b = le.AppendUint64(b, uint64(r.due))
+	b = le.AppendUint64(b, uint64(r.inbox))
 	r.seg.records++
 	b = le.AppendUint32(b, uint32(r.seg.number))
 	b = le.AppendUint64(b, uint64(r.offset))
@@ -67,6 +76,8 @@ func (j *journal) appendRecord(s *spool, r *record, ids map[traceID]bool) error 
 		}
 		b = append(b, flags)
 	}
+	r.fields = b[41:]
+	j.live[r.seq] = r
 	if err := j.frame(b); err != nil {
 		return err
 	}
@@ -82,6 +93,7 @@ func (j *journal) decision(id traceID, keep bool) error {
 	return j.frame(b[:])
 }
 func (j *journal) complete(r *record) error {
+	delete(j.live, r.seq)
 	a := j.audit
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -171,12 +183,54 @@ func (s *spool) recover(output *os.File, a *audit) (map[traceID]bool, error) {
 	j := &journal{f: f, w: bufio.NewWriterSize(f, 256<<10), audit: a, replay: true}
 	s.journal = j
 	records := make(map[uint64]*record)
+	j.live = records
+	j.adopted = make(map[int64]bool)
+	legacyDue := time.Now().Add(*decisionWait).UnixNano()
 	segments := make(map[int]*segment)
 	pending := make(map[traceID]bool)
 	var count int64
+	snapshot := false
 	err = j.scan(func(b []byte) error {
+		j.delta += int64(len(b) + 8)
 		switch b[0] {
-		case 'R':
+		case 'E':
+			snapshot = false
+			j.delta = 0
+		case 'H':
+			snapshot = true
+			if len(b) != 25 {
+				return fmt.Errorf("bad checkpoint header")
+			}
+			j.seq = le.Uint64(b[1:])
+			count = int64(le.Uint64(b[9:]))
+			j.checkpoints = int64(le.Uint64(b[17:]))
+			j.delta = 0
+		case 'Y', 'N':
+			if (len(b)-1)%16 != 0 {
+				return fmt.Errorf("bad checkpoint cache")
+			}
+			c := s.yes
+			if b[0] == 'N' {
+				c = s.no
+			}
+			for i := 1; i < len(b); i += 16 {
+				c.Put(traceID(b[i:i+16]), cache.DecisionMetadata{})
+			}
+		case 'T', 'R':
+			seq, due, inbox := j.seq+1, legacyDue, int64(0)
+			if b[0] == 'T' {
+				if len(b) < 42 {
+					return fmt.Errorf("short timestamped record")
+				}
+				seq = le.Uint64(b[1:])
+				due = int64(le.Uint64(b[9:]))
+				inbox = int64(le.Uint64(b[17:]))
+				b = b[24:]
+			}
+			if inbox != 0 {
+				j.adopted[inbox] = true
+			}
+			j.seq = max(j.seq, seq)
 			if len(b) < 34 || (len(b)-17)%17 != 0 {
 				return fmt.Errorf("invalid registration")
 			}
@@ -186,8 +240,7 @@ func (s *spool) recover(output *os.File, a *audit) (map[traceID]bool, error) {
 				g = &segment{number: n}
 				segments[n] = g
 			}
-			j.seq++
-			r := &record{seq: j.seq, seg: g, offset: int64(le.Uint64(b[5:])), length: int(le.Uint32(b[13:]))}
+			r := &record{seq: seq, due: due, inbox: inbox, fields: b[17:], seg: g, offset: int64(le.Uint64(b[5:])), length: int(le.Uint32(b[13:]))}
 			records[r.seq] = r
 			g.records++
 			for pos := 17; pos < len(b); pos += 17 {
@@ -195,10 +248,14 @@ func (s *spool) recover(output *os.File, a *audit) (map[traceID]bool, error) {
 				flags := b[pos+16]
 				switch flags & 6 {
 				case 2:
-					s.yes.Get(id)
+					if !snapshot {
+						s.yes.Get(id)
+					}
 					r.markKeep(id)
 				case 4:
-					s.no.Get(id)
+					if !snapshot {
+						s.no.Get(id)
+					}
 				case 0:
 					r.pending++
 					s.index[id] = append(s.index[id], r)

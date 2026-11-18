@@ -9,10 +9,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"google.golang.org/grpc/backoff"
+	"io"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -148,7 +152,37 @@ func (t template) fill(buf []byte, req int) []byte {
 func expected(n int) error {
 	bank := payloads()
 	a := audit{w: bufio.NewWriter(os.Stdout)}
+	selected := make(map[int]bool)
+	if *ackLog != "" {
+		f, e := os.Open(*ackLog)
+		if e != nil {
+			return e
+		}
+		defer f.Close()
+		cr := csv.NewReader(f)
+		cr.FieldsPerRecord = 4
+		for {
+			row, e := cr.Read()
+			if e == io.EOF {
+				break
+			}
+			if e != nil {
+				return e
+			}
+			id, e := strconv.Atoi(row[0])
+			if e != nil {
+				return e
+			}
+			selected[id] = row[3] == *ackFilter
+		}
+		if len(selected) != n {
+			return fmt.Errorf("outcome log has %d unique IDs, expected %d", len(selected), n)
+		}
+	}
 	for i := 0; i < n; i++ {
+		if *ackLog != "" && !selected[i] {
+			continue
+		}
 		if err := a.consume(fixture(i, bank, true)); err != nil {
 			return err
 		}
@@ -156,6 +190,8 @@ func expected(n int) error {
 	return a.w.Flush()
 }
 
+var ackLog = flag.String("ack-log", "", "continuous load outcome CSV, or oracle input")
+var ackFilter = flag.String("ack-filter", "1", "oracle outcome selector, 1 for ACK and 0 for failed")
 var startRequest = flag.Int("start-request", 0, "first fixture request ID")
 
 func load(n, rate int) error {
@@ -163,7 +199,18 @@ func load(n, rate int) error {
 	if err != nil {
 		return err
 	}
-	conn, err := grpc.NewClient("127.0.0.1:14317", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.ForceCodec(wireCodec{})))
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.ForceCodec(wireCodec{}))}
+	var outcomes *os.File
+	var logMu sync.Mutex
+	if *ackLog != "" {
+		outcomes, err = os.OpenFile(*ackLog, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return err
+		}
+		defer outcomes.Close()
+		opts = append(opts, grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoff.Config{BaseDelay: 20 * time.Millisecond, Multiplier: 1, MaxDelay: 20 * time.Millisecond}, MinConnectTimeout: time.Second}))
+	}
+	conn, err := grpc.NewClient("127.0.0.1:14317", opts...)
 	if err != nil {
 		return err
 	}
@@ -188,7 +235,26 @@ func load(n, rate int) error {
 				time.Sleep(time.Until(start.Add(time.Duration(float64(req) / float64(rate) * float64(time.Second)))))
 				id := req + *startRequest
 				buf = ts[id%25].fill(buf, id)
-				if err := conn.Invoke(ctx, "/opentelemetry.proto.collector.trace.v1.TraceService/Export", buf, &resp); err != nil {
+				begin := time.Now().UnixNano()
+				err := conn.Invoke(ctx, "/opentelemetry.proto.collector.trace.v1.TraceService/Export", buf, &resp)
+				if outcomes != nil {
+					end := time.Now().UnixNano()
+					ack := 1
+					if err != nil {
+						ack = 0
+					}
+					logMu.Lock()
+					_, writeErr := fmt.Fprintf(outcomes, "%d,%d,%d,%d\n", id, begin, end, ack)
+					logMu.Unlock()
+					if writeErr != nil {
+						once.Do(func() { first = writeErr; cancel() })
+						return
+					}
+					if err != nil {
+						continue
+					}
+				}
+				if err != nil {
 					once.Do(func() { first = err; cancel() })
 					return
 				}
