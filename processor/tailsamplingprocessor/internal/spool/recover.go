@@ -1,0 +1,383 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package spool // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.uber.org/zap"
+)
+
+type segment struct {
+	id   uint32
+	f    *os.File
+	size int64
+	refs int
+}
+
+func segmentPath(dir string, id uint32) string {
+	return filepath.Join(dir, "segments", fmt.Sprintf("%08x.otlp", id))
+}
+
+func (s *Spool) openSegmentLocked(id uint32) (*segment, error) {
+	f, err := os.OpenFile(segmentPath(s.cfg.Directory, id), os.O_CREATE|os.O_RDWR, 0o640)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	seg := &segment{id: id, f: f, size: info.Size()}
+	s.segs[id] = seg
+	return seg, nil
+}
+
+func (s *Spool) rotate() error {
+	old := s.active
+	if s.cfg.SyncOnRotate {
+		if err := old.f.Sync(); err != nil {
+			return fmt.Errorf("sync segment %d: %w", old.id, err)
+		}
+	}
+	seg, err := s.openSegmentLocked(old.id + 1)
+	if err != nil {
+		return err
+	}
+	if seg.size != 0 {
+		return fmt.Errorf("segment %d already has data", seg.id)
+	}
+	s.active = seg
+	if old.refs == 0 {
+		s.removeSegmentLocked(old)
+	}
+	return nil
+}
+
+func (s *Spool) removeSegmentLocked(seg *segment) {
+	// The commits that released the segment must reach the file first, or a
+	// restart would find registrations pointing into a removed segment.
+	if s.log != nil {
+		if err := s.log.flush(); err != nil {
+			s.fail(err)
+			return
+		}
+	}
+	delete(s.segs, seg.id)
+	seg.f.Close()
+	if err := os.Remove(segmentPath(s.cfg.Directory, seg.id)); err != nil {
+		s.logger.Warn("Failed to remove tail spool segment", zap.Uint32("segment", seg.id), zap.Error(err))
+	}
+}
+
+// Recovered describes the state restored from disk.
+type Recovered struct {
+	// Refeed lists, in sequence order, records with associations that were
+	// not decided before the restart. The processor must handle the listed
+	// fragments again to rebuild its pending traces.
+	Refeed []RefeedRecord
+	// Memo lists recent decisions in decision order.
+	Memo []memoEntry
+}
+
+// RefeedRecord is a record with associations to process again.
+type RefeedRecord struct {
+	Record *Record
+	// IDs are the trace IDs whose fragments must be processed again.
+	IDs map[pcommon.TraceID]int
+}
+
+// MemoEntry is a decision restored after a restart.
+type MemoEntry = memoEntry
+
+// Open replays the log in cfg.Directory and returns a spool that delivers
+// kept spans to next once Start is called.
+func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recovered, error) {
+	if err := ensureDir(cfg.Directory); err != nil {
+		return nil, nil, err
+	}
+	s := &Spool{
+		cfg:     cfg,
+		logger:  logger,
+		next:    next,
+		segs:    map[uint32]*segment{},
+		records: map[uint64]*Record{},
+		pending: map[pcommon.TraceID][]assocRef{},
+		memo:    newMemo(cfg.MemoCapacity),
+		nextSeq: 1,
+	}
+	s.readyCond = sync.NewCond(&s.mu)
+
+	f, err := os.OpenFile(logPath(cfg.Directory), os.O_CREATE|os.O_RDWR, 0o640)
+	if err != nil {
+		return nil, nil, err
+	}
+	rp := &replay{s: s}
+	end, err := readLog(f, rp.apply)
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("replay tail spool log: %w", err)
+	}
+	if err := f.Truncate(end); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if _, err := f.Seek(end, io.SeekStart); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	s.log = newLogWriter(f, end)
+
+	rec, err := s.finishReplay()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return s, rec, nil
+}
+
+type replay struct {
+	s     *Spool
+	order []*Record
+	swept int
+}
+
+func (rp *replay) record(seq uint64) *Record {
+	return rp.s.records[seq]
+}
+
+func (rp *replay) apply(f frame) error {
+	s := rp.s
+	switch f.kind {
+	case frameHeader:
+		s.nextSeq = max(s.nextSeq, f.seq)
+	case frameRecord:
+		// The segment of a record committed later in the log may already be
+		// gone, so files are only opened for records still live at the end.
+		seg, ok := s.segs[f.seg]
+		if !ok {
+			seg = &segment{id: f.seg}
+			s.segs[f.seg] = seg
+		}
+		r := &Record{
+			seq: f.seq, seg: seg, off: f.off, length: f.length, arrival: f.arrival,
+			ids: f.ids, state: make([]assocState, len(f.ids)), open: len(f.ids),
+		}
+		seg.refs++
+		s.records[r.seq] = r
+		rp.order = append(rp.order, r)
+		s.nextSeq = max(s.nextSeq, f.seq+1)
+	case frameWatermark:
+		rp.sweep(f.seq)
+	case frameKeep, frameDrop:
+		rp.sweep(f.seq)
+		s.memo.put(f.id, f.kind == frameKeep)
+		s.settlePendingLocked(f.id, f.kind == frameKeep)
+	case frameEvict:
+		rp.sweep(f.seq)
+		s.memo.remove(f.id)
+		s.settlePendingLocked(f.id, false)
+	case frameLate:
+		r := rp.record(f.seq)
+		if r == nil {
+			return nil
+		}
+		i := slices.Index(r.ids, f.id)
+		if i < 0 {
+			return fmt.Errorf("%w: trace %s not in record %d", errCorrupt, f.id, f.seq)
+		}
+		if r.state[i] == pending {
+			refs := s.pending[f.id]
+			refs = slices.DeleteFunc(refs, func(ref assocRef) bool { return ref.rec == r && ref.idx == i })
+			if len(refs) == 0 {
+				delete(s.pending, f.id)
+			} else {
+				s.pending[f.id] = refs
+			}
+			r.state[i] = unsettled
+		}
+		s.settleLocked(r, i, f.keep)
+	case frameCommit:
+		if r := rp.record(f.seq); r != nil {
+			s.ready = slices.DeleteFunc(s.ready, func(x *Record) bool { return x == r })
+			s.releaseLocked(r)
+		}
+	case frameMemo:
+		s.memo.put(f.id, f.keep)
+	}
+	return nil
+}
+
+// sweep attaches the unsettled associations of records up to wm.
+func (rp *replay) sweep(wm uint64) {
+	s := rp.s
+	if wm <= s.wm {
+		return
+	}
+	s.wm = wm
+	for rp.swept < len(rp.order) && rp.order[rp.swept].seq <= wm {
+		r := rp.order[rp.swept]
+		rp.swept++
+		if r.done {
+			continue
+		}
+		for i := range r.ids {
+			if r.state[i] == unsettled {
+				r.state[i] = pending
+				s.pending[r.ids[i]] = append(s.pending[r.ids[i]], assocRef{rec: r, idx: i})
+			}
+		}
+	}
+}
+
+// finishReplay reopens segments, removes unreferenced files, and prepares
+// the records that must be processed again.
+func (s *Spool) finishReplay() (*Recovered, error) {
+	// A trace with associations attached after its last logged decision was
+	// a new instance at runtime, so its old decision was no longer cached.
+	for id := range s.pending {
+		s.memo.remove(id)
+	}
+	s.pending = map[pcommon.TraceID][]assocRef{}
+	s.stats.Committed = 0
+
+	for id, seg := range s.segs {
+		if seg.refs == 0 {
+			delete(s.segs, id)
+			continue
+		}
+		f, err := os.OpenFile(segmentPath(s.cfg.Directory, id), os.O_RDWR, 0)
+		if err != nil {
+			return nil, fmt.Errorf("%w: open segment %d: %v", errCorrupt, id, err)
+		}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		seg.f, seg.size = f, info.Size()
+	}
+	for _, r := range s.records {
+		if r.off+int64(r.length) > r.seg.size {
+			return nil, fmt.Errorf("%w: record %d extends past segment %d", errCorrupt, r.seq, r.seg.id)
+		}
+	}
+
+	rec := &Recovered{Memo: s.memo.entries()}
+	for _, r := range s.sortedRecordsLocked() {
+		ids := map[pcommon.TraceID]int{}
+		for i, st := range r.state {
+			if st == pending || st == unsettled {
+				r.state[i] = unsettled
+				ids[r.ids[i]] = i
+			}
+		}
+		if len(ids) > 0 {
+			rec.Refeed = append(rec.Refeed, RefeedRecord{Record: r, IDs: ids})
+		}
+	}
+
+	var maxID uint32
+	entries, err := os.ReadDir(filepath.Join(s.cfg.Directory, "segments"))
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".otlp")
+		if !ok {
+			continue
+		}
+		id, err := strconv.ParseUint(name, 16, 32)
+		if err != nil {
+			continue
+		}
+		maxID = max(maxID, uint32(id))
+		if _, ok := s.segs[uint32(id)]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.cfg.Directory, "segments", e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	for id := range s.segs {
+		maxID = max(maxID, id)
+	}
+	active, err := s.openSegmentLocked(maxID + 1)
+	if err != nil {
+		return nil, err
+	}
+	s.active = active
+	s.checkpointLocked()
+	return rec, s.err
+}
+
+func (s *Spool) maybeCheckpointLocked() {
+	if s.cfg.CheckpointBytes > 0 && s.log.size > s.cfg.CheckpointBytes {
+		s.checkpointLocked()
+	}
+}
+
+// checkpointLocked rewrites the live state into a new log and atomically
+// replaces the old one.
+func (s *Spool) checkpointLocked() {
+	if s.err != nil {
+		return
+	}
+	tmp := logPath(s.cfg.Directory) + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o640)
+	if err != nil {
+		s.fail(fmt.Errorf("create checkpoint: %w", err))
+		return
+	}
+	w := newLogWriter(f, 0)
+	recs := s.sortedRecordsLocked()
+	err = w.append(&frame{kind: frameHeader, seq: s.nextSeq})
+	for _, r := range recs {
+		if err == nil {
+			err = w.append(&frame{kind: frameRecord, seq: r.seq, seg: r.seg.id, off: r.off, length: r.length, arrival: r.arrival, ids: r.ids})
+		}
+	}
+	for _, r := range recs {
+		for i, st := range r.state {
+			if err == nil && (st == kept || st == dropped) {
+				err = w.append(&frame{kind: frameLate, seq: r.seq, id: r.ids[i], keep: st == kept})
+			}
+		}
+	}
+	if err == nil {
+		err = w.append(&frame{kind: frameWatermark, seq: s.wm})
+	}
+	for _, e := range s.memo.entries() {
+		if err == nil {
+			err = w.append(&frame{kind: frameMemo, id: e.ID, keep: e.Keep})
+		}
+	}
+	if err == nil {
+		err = w.flush()
+	}
+	if err == nil {
+		err = os.Rename(tmp, logPath(s.cfg.Directory))
+	}
+	if err != nil {
+		f.Close()
+		s.fail(fmt.Errorf("write checkpoint: %w", err))
+		return
+	}
+	if s.log != nil {
+		s.log.f.Close()
+	}
+	s.log = w
+	s.stats.Checkpoints++
+}
