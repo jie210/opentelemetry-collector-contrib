@@ -20,6 +20,29 @@ type TraceData struct {
 	SizeBytes uint64
 	// ReceivedBatches stores all the batches received for the trace.
 	ReceivedBatches ptrace.Traces
+	// Folded is set by the tail spool, which keeps spans on disk. In that
+	// case ReceivedBatches is empty and leaf policies read the verdict they
+	// accumulated while the trace's fragments arrived.
+	Folded *FoldedTrace
+}
+
+// FoldedTrace is the ingest-time summary of a trace kept by the tail spool.
+type FoldedTrace struct {
+	// Leaves holds one entry per folded leaf policy, in policy tree order.
+	Leaves []FoldedLeaf
+	// TracesSize is the sum over received fragments of the protobuf size of
+	// each fragment wrapped in its own Traces message.
+	TracesSize int64
+}
+
+// FoldedLeaf is the running verdict of one leaf policy.
+type FoldedLeaf struct {
+	Decision Decision
+	Err      error
+	// Done reports that later fragments can no longer change the verdict.
+	Done bool
+	// Lo and Hi hold running bounds for order-dependent leaves.
+	Lo, Hi uint64
 }
 
 // Decision gives the status of sampling decision.
@@ -120,6 +143,15 @@ func AsThresholdEvaluator(e Evaluator) ThresholdEvaluator {
 		return te
 	}
 	return &decisionAdapter{Evaluator: e}
+}
+
+// UnwrapThresholdEvaluator returns the Evaluator that AsThresholdEvaluator
+// wrapped, or te itself if it was not wrapped.
+func UnwrapThresholdEvaluator(te ThresholdEvaluator) Evaluator {
+	if a, ok := te.(*decisionAdapter); ok {
+		return a.Evaluator
+	}
+	return te
 }
 
 // decisionAdapter wraps a plain Evaluator so it satisfies

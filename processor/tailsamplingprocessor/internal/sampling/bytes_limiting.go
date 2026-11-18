@@ -69,6 +69,9 @@ func (*bytesLimiting) IsStateful() bool {
 // calculateTraceSize calculates the accurate protobuf marshaled size of a trace in bytes
 // using the OpenTelemetry Collector's built-in ProtoMarshaler.TracesSize() method
 func calculateTraceSize(trace *samplingpolicy.TraceData) int64 {
+	if trace.Folded != nil {
+		return trace.Folded.TracesSize
+	}
 	// Use the OpenTelemetry Collector's built-in method for accurate size calculation
 	// This gives us the exact protobuf marshaled size
 	marshaler := &ptrace.ProtoMarshaler{}
