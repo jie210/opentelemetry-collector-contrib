@@ -58,6 +58,14 @@ const (
 	dropped
 )
 
+// Assoc identifies the spans of one trace within one ResourceSpans of a
+// request. Each is settled separately, as the processor may handle them as
+// different instances of the trace.
+type Assoc struct {
+	ID       pcommon.TraceID
+	Resource uint32
+}
+
 // Record is a registered raw request.
 type Record struct {
 	seq     uint64
@@ -65,7 +73,7 @@ type Record struct {
 	off     int64
 	length  uint32
 	arrival int64
-	ids     []pcommon.TraceID
+	assocs  []Assoc
 	state   []assocState
 	open    int
 	keeps   int
@@ -74,6 +82,9 @@ type Record struct {
 
 // Seq returns the record's sequence number.
 func (r *Record) Seq() uint64 { return r.seq }
+
+// Assocs returns the record's associations.
+func (r *Record) Assocs() []Assoc { return r.assocs }
 
 // Arrival returns when the request was registered.
 func (r *Record) Arrival() time.Time { return time.Unix(0, r.arrival) }
@@ -136,9 +147,9 @@ func (s *Spool) fail(err error) error {
 	return s.err
 }
 
-// Register appends raw and registers the distinct trace IDs it contains.
-// The request may be acknowledged once Register returns without error.
-func (s *Spool) Register(raw []byte, ids []pcommon.TraceID, arrival time.Time) (*Record, error) {
+// Register appends raw and registers its associations. The request may be
+// acknowledged once Register returns without error.
+func (s *Spool) Register(raw []byte, assocs []Assoc, arrival time.Time) (*Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.err != nil {
@@ -164,10 +175,10 @@ func (s *Spool) Register(raw []byte, ids []pcommon.TraceID, arrival time.Time) (
 	}
 	r := &Record{
 		seq: s.nextSeq, seg: seg, off: off, length: uint32(len(raw)), arrival: arrival.UnixNano(),
-		ids: ids, state: make([]assocState, len(ids)), open: len(ids),
+		assocs: assocs, state: make([]assocState, len(assocs)), open: len(assocs),
 	}
 	s.nextSeq++
-	if err := s.log.append(&frame{kind: frameRecord, seq: r.seq, seg: seg.id, off: off, length: r.length, arrival: r.arrival, ids: ids}); err != nil {
+	if err := s.log.append(&frame{kind: frameRecord, seq: r.seq, seg: seg.id, off: off, length: r.length, arrival: r.arrival, assocs: assocs}); err != nil {
 		return nil, s.fail(err)
 	}
 	if err := s.log.flush(); err != nil {
@@ -184,8 +195,7 @@ func (s *Spool) Register(raw []byte, ids []pcommon.TraceID, arrival time.Time) (
 	return r, nil
 }
 
-// Attach adds the record's association with ids[i] to the trace's pending
-// instance.
+// Attach adds the record's association i to the trace's pending instance.
 func (s *Spool) Attach(r *Record, i int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,19 +203,19 @@ func (s *Spool) Attach(r *Record, i int) {
 		return
 	}
 	r.state[i] = pending
-	id := r.ids[i]
+	id := r.assocs[i].ID
 	s.pending[id] = append(s.pending[id], assocRef{rec: r, idx: i})
 }
 
-// Inherit settles the record's association with ids[i] by a decision made
-// earlier for the trace.
+// Inherit settles the record's association i by a decision made earlier for
+// the trace.
 func (s *Spool) Inherit(r *Record, i int, keep bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r.state[i] != unsettled {
 		return
 	}
-	s.appendLocked(&frame{kind: frameLate, seq: r.seq, id: r.ids[i], keep: keep})
+	s.appendLocked(&frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: keep})
 	s.settleLocked(r, i, keep)
 }
 
@@ -241,7 +251,7 @@ func (s *Spool) Evict(id pcommon.TraceID) {
 func (s *Spool) logBeyondWatermarkLocked(id pcommon.TraceID, keep bool) {
 	for _, ref := range s.pending[id] {
 		if ref.rec.seq > s.wm {
-			s.appendLocked(&frame{kind: frameLate, seq: ref.rec.seq, id: id, keep: keep})
+			s.appendLocked(&frame{kind: frameLate, seq: ref.rec.seq, idx: uint32(ref.idx), keep: keep})
 		}
 	}
 }
@@ -349,11 +359,13 @@ type memo struct {
 	capacity [2]int
 	order    [2]*list.List
 	byID     map[pcommon.TraceID]*list.Element
+	next     uint64
 }
 
 type memoEntry struct {
 	ID   pcommon.TraceID
 	Keep bool
+	seq  uint64
 }
 
 func side(keep bool) int {
@@ -378,7 +390,8 @@ func (m *memo) put(id pcommon.TraceID, keep bool) {
 		return
 	}
 	order := m.order[i]
-	m.byID[id] = order.PushBack(memoEntry{ID: id, Keep: keep})
+	m.next++
+	m.byID[id] = order.PushBack(memoEntry{ID: id, Keep: keep, seq: m.next})
 	for order.Len() > m.capacity[i] {
 		front := order.Front()
 		delete(m.byID, front.Value.(memoEntry).ID)
@@ -393,14 +406,17 @@ func (m *memo) remove(id pcommon.TraceID) {
 	}
 }
 
-// entries returns the drop decisions and then the keep decisions, each
-// oldest first.
+// entries returns the remembered decisions, oldest first.
 func (m *memo) entries() []memoEntry {
 	out := make([]memoEntry, 0, len(m.byID))
-	for _, order := range m.order {
-		for e := order.Front(); e != nil; e = e.Next() {
-			out = append(out, e.Value.(memoEntry))
+	drops, keeps := m.order[0].Front(), m.order[1].Front()
+	for drops != nil || keeps != nil {
+		e := &drops
+		if drops == nil || (keeps != nil && keeps.Value.(memoEntry).seq < drops.Value.(memoEntry).seq) {
+			e = &keeps
 		}
+		out = append(out, (*e).Value.(memoEntry))
+		*e = (*e).Next()
 	}
 	return out
 }

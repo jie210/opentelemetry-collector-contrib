@@ -381,6 +381,10 @@ type Config struct {
 	// and values greater than 1 are not supported with tail_storage.
 	// Defaults to 1 (single event loop, original behavior).
 	NumShards uint32 `mapstructure:"num_shards"`
+	// Spool keeps the raw requests of pending traces on disk instead of their
+	// spans in memory. It requires the tailspool receiver directly in front
+	// of the processor.
+	Spool *SpoolConfig `mapstructure:"spool"`
 }
 
 // maxNumShards bounds num_shards to catch configuration mistakes: each shard
@@ -420,5 +424,8 @@ func (cfg *Config) Validate() error {
 		)
 	}
 
+	if cfg.Spool != nil {
+		return cfg.validateSpool()
+	}
 	return nil
 }

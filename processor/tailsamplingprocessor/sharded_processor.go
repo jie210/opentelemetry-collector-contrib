@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/metadata"
 )
@@ -181,6 +182,10 @@ func (sp *shardedProcessor) Shutdown(ctx context.Context) error {
 }
 
 func (sp *shardedProcessor) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+	if sp.shards[0].cfg.Spool != nil {
+		return sp.shards[0].consumeSpooled(ctx, td)
+	}
+
 	_, span := sp.tracer.Start(ctx, "tailsampling.ConsumeTraces")
 	defer span.End()
 
@@ -217,7 +222,20 @@ func (sp *shardedProcessor) ConsumeTraces(ctx context.Context, td ptrace.Traces)
 	return nil
 }
 
+// rejectSpoolReload reports whether a runtime reload must be refused: the
+// folded state of pending traces is built for the policies loaded at start.
+func (sp *shardedProcessor) rejectSpoolReload(what string) bool {
+	if sp.shards[0].cfg.Spool == nil {
+		return false
+	}
+	sp.shards[0].logger.Error("Runtime reload is not supported with the spool; restart the collector instead", zap.String("setting", what))
+	return true
+}
+
 func (sp *shardedProcessor) SetSamplingPolicy(cfgs []PolicyCfg) {
+	if sp.rejectSpoolReload("policies") {
+		return
+	}
 	cfgs = dividePolicyRates(cfgs, sp.numShards)
 	for _, s := range sp.shards {
 		s.SetSamplingPolicy(cfgs)
@@ -225,6 +243,9 @@ func (sp *shardedProcessor) SetSamplingPolicy(cfgs []PolicyCfg) {
 }
 
 func (sp *shardedProcessor) SetMaximumTraceSizeBytes(size uint64) {
+	if sp.rejectSpoolReload("maximum_trace_size_bytes") {
+		return
+	}
 	for _, s := range sp.shards {
 		s.SetMaximumTraceSizeBytes(size)
 	}

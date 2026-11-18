@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 )
@@ -66,10 +65,10 @@ func (s *Spool) worker() {
 		r := s.ready[0]
 		s.ready = s.ready[1:]
 		s.inflight += int64(r.length)
-		keep := make(map[pcommon.TraceID]struct{}, r.keeps)
+		keep := make(map[Assoc]struct{}, r.keeps)
 		for i, st := range r.state {
 			if st == kept {
-				keep[r.ids[i]] = struct{}{}
+				keep[r.assocs[i]] = struct{}{}
 			}
 		}
 		s.mu.Unlock()
@@ -96,7 +95,7 @@ func (s *Spool) worker() {
 // deliver reads the record, keeps the spans of kept traces and hands them to
 // the next consumer, retrying until it succeeds or the spool stops. It
 // reports whether the record is finished.
-func (s *Spool) deliver(r *Record, keep map[pcommon.TraceID]struct{}) bool {
+func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) bool {
 	td, err := s.readRecord(r)
 	if err != nil {
 		s.logger.Error("Dropping unreadable tail spool record", zap.Uint64("seq", r.seq), zap.Error(err))
@@ -151,14 +150,17 @@ func (s *Spool) readRecord(r *Record) (ptrace.Traces, error) {
 	return td, nil
 }
 
-// filterKept removes spans of traces not in keep, along with emptied scopes
-// and resources, and returns the number of remaining spans.
-func filterKept(td ptrace.Traces, keep map[pcommon.TraceID]struct{}) int {
+// filterKept removes spans of associations not in keep, along with emptied
+// scopes and resources, and returns the number of remaining spans.
+func filterKept(td ptrace.Traces, keep map[Assoc]struct{}) int {
 	var n int
+	resource := uint32(0)
 	td.ResourceSpans().RemoveIf(func(rs ptrace.ResourceSpans) bool {
+		ri := resource
+		resource++
 		rs.ScopeSpans().RemoveIf(func(ss ptrace.ScopeSpans) bool {
 			ss.Spans().RemoveIf(func(span ptrace.Span) bool {
-				_, ok := keep[span.TraceID()]
+				_, ok := keep[Assoc{ID: span.TraceID(), Resource: ri}]
 				return !ok
 			})
 			n += ss.Spans().Len()

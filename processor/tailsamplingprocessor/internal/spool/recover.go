@@ -95,8 +95,8 @@ type Recovered struct {
 // RefeedRecord is a record with associations to process again.
 type RefeedRecord struct {
 	Record *Record
-	// IDs are the trace IDs whose fragments must be processed again.
-	IDs map[pcommon.TraceID]int
+	// Assocs are the indexes of the associations to process again.
+	Assocs []int
 }
 
 // MemoEntry is a decision restored after a restart.
@@ -173,7 +173,7 @@ func (rp *replay) apply(f frame) error {
 		}
 		r := &Record{
 			seq: f.seq, seg: seg, off: f.off, length: f.length, arrival: f.arrival,
-			ids: f.ids, state: make([]assocState, len(f.ids)), open: len(f.ids),
+			assocs: f.assocs, state: make([]assocState, len(f.assocs)), open: len(f.assocs),
 		}
 		seg.refs++
 		s.records[r.seq] = r
@@ -194,17 +194,17 @@ func (rp *replay) apply(f frame) error {
 		if r == nil {
 			return nil
 		}
-		i := slices.Index(r.ids, f.id)
-		if i < 0 {
-			return fmt.Errorf("%w: trace %s not in record %d", errCorrupt, f.id, f.seq)
+		i := int(f.idx)
+		if i >= len(r.assocs) {
+			return fmt.Errorf("%w: association %d not in record %d", errCorrupt, i, f.seq)
 		}
 		if r.state[i] == pending {
-			refs := s.pending[f.id]
-			refs = slices.DeleteFunc(refs, func(ref assocRef) bool { return ref.rec == r && ref.idx == i })
+			id := r.assocs[i].ID
+			refs := slices.DeleteFunc(s.pending[id], func(ref assocRef) bool { return ref.rec == r && ref.idx == i })
 			if len(refs) == 0 {
-				delete(s.pending, f.id)
+				delete(s.pending, id)
 			} else {
-				s.pending[f.id] = refs
+				s.pending[id] = refs
 			}
 			r.state[i] = unsettled
 		}
@@ -233,10 +233,10 @@ func (rp *replay) sweep(wm uint64) {
 		if r.done {
 			continue
 		}
-		for i := range r.ids {
+		for i, a := range r.assocs {
 			if r.state[i] == unsettled {
 				r.state[i] = pending
-				s.pending[r.ids[i]] = append(s.pending[r.ids[i]], assocRef{rec: r, idx: i})
+				s.pending[a.ID] = append(s.pending[a.ID], assocRef{rec: r, idx: i})
 			}
 		}
 	}
@@ -277,15 +277,15 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 
 	rec := &Recovered{Memo: s.memo.entries()}
 	for _, r := range s.sortedRecordsLocked() {
-		ids := map[pcommon.TraceID]int{}
+		var open []int
 		for i, st := range r.state {
 			if st == pending || st == unsettled {
 				r.state[i] = unsettled
-				ids[r.ids[i]] = i
+				open = append(open, i)
 			}
 		}
-		if len(ids) > 0 {
-			rec.Refeed = append(rec.Refeed, RefeedRecord{Record: r, IDs: ids})
+		if len(open) > 0 {
+			rec.Refeed = append(rec.Refeed, RefeedRecord{Record: r, Assocs: open})
 		}
 	}
 	// Records to refeed count as unprocessed again.
@@ -351,13 +351,13 @@ func (s *Spool) checkpointLocked() {
 	err = w.append(&frame{kind: frameHeader, seq: s.nextSeq})
 	for _, r := range recs {
 		if err == nil {
-			err = w.append(&frame{kind: frameRecord, seq: r.seq, seg: r.seg.id, off: r.off, length: r.length, arrival: r.arrival, ids: r.ids})
+			err = w.append(&frame{kind: frameRecord, seq: r.seq, seg: r.seg.id, off: r.off, length: r.length, arrival: r.arrival, assocs: r.assocs})
 		}
 	}
 	for _, r := range recs {
 		for i, st := range r.state {
 			if err == nil && (st == kept || st == dropped) {
-				err = w.append(&frame{kind: frameLate, seq: r.seq, id: r.ids[i], keep: st == kept})
+				err = w.append(&frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: st == kept})
 			}
 		}
 	}

@@ -20,7 +20,7 @@ const (
 	// frameHeader starts a checkpoint: version and next record sequence.
 	frameHeader = 'H'
 	// frameRecord registers a raw request: seq, segment, offset, length,
-	// arrival time and the distinct trace IDs it contains.
+	// arrival time and its associations.
 	frameRecord = 'T'
 	// frameKeep and frameDrop publish a decision for every association
 	// attached to the trace's pending instance. They carry the processed
@@ -30,7 +30,8 @@ const (
 	// frameEvict ends a pending instance removed for capacity; its
 	// associations settle as drop. Carries the processed watermark.
 	frameEvict = 'V'
-	// frameLate settles one association by an inherited decision.
+	// frameLate settles one association, by record and index, with an
+	// inherited decision.
 	frameLate = 'L'
 	// frameCommit marks a record delivered or fully dropped.
 	frameCommit = 'C'
@@ -40,7 +41,7 @@ const (
 	frameMemo = 'M'
 )
 
-const walVersion = 1
+const walVersion = 2
 
 var errCorrupt = errors.New("tail spool log is corrupt")
 
@@ -52,7 +53,8 @@ type frame struct {
 	length  uint32
 	arrival int64
 	id      pcommon.TraceID
-	ids     []pcommon.TraceID
+	idx     uint32
+	assocs  []Assoc
 	keep    bool
 }
 
@@ -68,16 +70,17 @@ func (f *frame) encode(b []byte) []byte {
 		b = binary.LittleEndian.AppendUint64(b, uint64(f.off))
 		b = binary.LittleEndian.AppendUint32(b, f.length)
 		b = binary.LittleEndian.AppendUint64(b, uint64(f.arrival))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(f.ids)))
-		for _, id := range f.ids {
-			b = append(b, id[:]...)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(f.assocs)))
+		for _, a := range f.assocs {
+			b = append(b, a.ID[:]...)
+			b = binary.LittleEndian.AppendUint32(b, a.Resource)
 		}
 	case frameKeep, frameDrop, frameEvict:
 		b = binary.LittleEndian.AppendUint64(b, f.seq)
 		b = append(b, f.id[:]...)
 	case frameLate:
 		b = binary.LittleEndian.AppendUint64(b, f.seq)
-		b = append(b, f.id[:]...)
+		b = binary.LittleEndian.AppendUint32(b, f.idx)
 		b = appendBool(b, f.keep)
 	case frameCommit, frameWatermark:
 		b = binary.LittleEndian.AppendUint64(b, f.seq)
@@ -114,19 +117,19 @@ func decodeFrame(p []byte) (frame, error) {
 		f.length = r.u32()
 		f.arrival = int64(r.u64())
 		n := int(r.u32())
-		if r.ok() && len(r.b) != n*16 {
+		if r.ok() && len(r.b) != n*20 {
 			return f, errCorrupt
 		}
-		f.ids = make([]pcommon.TraceID, n)
-		for i := range f.ids {
-			f.ids[i] = r.id()
+		f.assocs = make([]Assoc, n)
+		for i := range f.assocs {
+			f.assocs[i] = Assoc{ID: r.id(), Resource: r.u32()}
 		}
 	case frameKeep, frameDrop, frameEvict:
 		f.seq = r.u64()
 		f.id = r.id()
 	case frameLate:
 		f.seq = r.u64()
-		f.id = r.id()
+		f.idx = r.u32()
 		f.keep = r.u8() == 1
 	case frameCommit, frameWatermark:
 		f.seq = r.u64()

@@ -4,6 +4,7 @@
 package tailsamplingprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor"
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"runtime"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/idbatcher"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/sampling"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/tailstorageextension"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/telemetry"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/pkg/samplingpolicy"
@@ -110,6 +113,14 @@ type tailSamplingSpanProcessor struct {
 	// tickChan triggers ticks and responds on the provided channel when the tick is complete.
 	// this is used in tests to produce deterministic ticks.
 	tickChan chan chan struct{}
+
+	// spool, when configured, holds the raw requests of pending traces and
+	// foldPlan the state kept per trace in their place.
+	spool     *spool.Spool
+	foldPlan  *sampling.FoldPlan
+	recovered *spool.Recovered
+	// ingestMu keeps registered requests in sequence order on workChan.
+	ingestMu sync.Mutex
 }
 
 func newTracesProcessor(ctx context.Context, set processor.Settings, nextConsumer consumer.Traces, cfg Config) (processor.Traces, error) {
@@ -216,6 +227,12 @@ func (tsp *tailSamplingSpanProcessor) Start(_ context.Context, host component.Ho
 		tsp.decisionBatcher = idBatcher
 	}
 
+	if tsp.cfg.Spool != nil {
+		if tsp.recovered, err = tsp.startSpool(); err != nil {
+			return err
+		}
+	}
+
 	tsp.doneChan = make(chan struct{})
 	go tsp.loop()
 	return nil
@@ -290,6 +307,9 @@ type traceBatch struct {
 	hasRoot   bool
 	rss       ptrace.ResourceSpans
 	spanCount int64
+	// rec and idx locate the trace's association in the spooled request.
+	rec *spool.Record
+	idx int
 }
 
 type newPolicyCmd struct {
@@ -521,6 +541,10 @@ func (tsp *tailSamplingSpanProcessor) loop() {
 	ticker := time.NewTicker(tsp.tickerFrequency)
 	defer ticker.Stop()
 	defer close(tsp.doneChan)
+	if tsp.recovered != nil {
+		tsp.restoreSpool(tsp.recovered, ticker.C)
+		tsp.recovered = nil
+	}
 	for tsp.iter(ticker.C, tsp.workChan) {
 	}
 }
@@ -535,6 +559,11 @@ func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <
 		if !ok {
 			// Stop the batcher so that we can read all batches without creating new ones.
 			tsp.decisionBatcher.Stop()
+
+			// Spooled traces stay pending on disk for the next start.
+			if tsp.spool != nil {
+				return false
+			}
 
 			// Do the best decision we can for any traces we have already ingested unless a user wants to drop them.
 			if !tsp.cfg.DropPendingTracesOnShutdown {
@@ -562,6 +591,11 @@ func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <
 			tsp.maxTraceSizeBytes = maxTraceSize
 			tsp.logger.Debug("New maximum trace size loaded", zap.Uint64("size", maxTraceSize))
 		default:
+		}
+
+		if tsp.spool != nil {
+			tsp.processSpooledRecord(batch, tickChan, time.Time{})
+			return true
 		}
 
 		for _, trace := range batch {
@@ -643,6 +677,9 @@ func (tsp *tailSamplingSpanProcessor) waitForSpace(tickChan <-chan time.Time) {
 		// This should be impossible.
 		tsp.logger.Error("deleteTraceQueue is empty, but we're waiting for space. This is a bug!")
 		return
+	}
+	if _, ok := tsp.idToTrace[front.Value.(pcommon.TraceID)]; ok && tsp.spool != nil {
+		tsp.spool.Evict(front.Value.(pcommon.TraceID))
 	}
 	if !tsp.dropTrace(front.Value.(pcommon.TraceID), time.Now()) {
 		// Somehow the trace was already removed from idToTrace, but not the
@@ -728,7 +765,14 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 	// instead: finalize any still-pending trace as implicit not sampled
 	// without policy evaluation, so no candidate is collected for it.
 	candidates := make([]tickCandidate, 0, batchLen)
+	// Decide in a fixed order so that the decision caches evolve the same way
+	// on every run, including a spool replay.
+	ids := make([]pcommon.TraceID, 0, batchLen)
 	for id := range batch {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b pcommon.TraceID) int { return bytes.Compare(a[:], b[:]) })
+	for _, id := range ids {
 		trace, ok := tsp.idToTrace[id]
 		if !ok {
 			metrics.idNotFoundOnMapCount++
@@ -755,6 +799,20 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 			// already performed by releaseNotSampledTrace when a cache is
 			// configured is harmless.
 			tsp.dropTrace(id, trace.decisionTime)
+			continue
+		}
+
+		if tsp.spool != nil {
+			candidates = append(candidates, tickCandidate{
+				id:    id,
+				trace: trace,
+				data: &samplingpolicy.TraceData{
+					SpanCount:       trace.SpanCount,
+					SizeBytes:       trace.SizeBytes,
+					ReceivedBatches: ptrace.NewTraces(),
+					Folded:          trace.Folded,
+				},
+			})
 			continue
 		}
 
@@ -806,6 +864,10 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 		c.trace.ReceivedBatches = c.data.ReceivedBatches
 		c.trace.FinalDecision = samplingpolicy.Dropped
 		c.trace.PolicyName = p.name
+		if tsp.spool != nil {
+			tsp.spool.Decide(c.id, false)
+			c.trace.Folded = nil
+		}
 		tsp.releaseNotSampledTrace(c.id, c.trace)
 		c.trace.ReceivedBatches = ptrace.NewTraces()
 	}
@@ -824,6 +886,10 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 		c.trace.FinalDecision = decision
 		c.trace.FinalThreshold = threshold
 		c.trace.PolicyName = policyName
+		if tsp.spool != nil {
+			tsp.spool.Decide(c.id, decision == samplingpolicy.Sampled)
+			c.trace.Folded = nil
+		}
 
 		if decision == samplingpolicy.Sampled {
 			tsp.releaseSampledTrace(ctx, c.id, c.trace)
@@ -833,6 +899,9 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 
 		// Sampled or not, remove the batches
 		c.trace.ReceivedBatches = ptrace.NewTraces()
+	}
+	if tsp.spool != nil {
+		tsp.spool.Flush()
 	}
 
 	tsp.telemetry.ProcessorTailSamplingSamplingDecisionTimerLatency.Record(tsp.ctx, time.Since(startTime).Milliseconds())
@@ -1033,6 +1102,9 @@ func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 		hasRoot   bool
 	}
 	builders := make(map[pcommon.TraceID]*builder)
+	// Traces are emitted in first-seen order so that the decision caches see
+	// the same access order on every run, including a spool replay.
+	var order []pcommon.TraceID
 
 	for j := 0; j < srcScopes.Len(); j++ {
 		srcScope := srcScopes.At(j)
@@ -1047,6 +1119,7 @@ func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 				rs.SetSchemaUrl(rss.SchemaUrl())
 				b = &builder{rs: rs, lastScope: -1}
 				builders[id] = b
+				order = append(order, id)
 			}
 			if b.lastScope != j {
 				dest := b.rs.ScopeSpans().AppendEmpty()
@@ -1065,7 +1138,8 @@ func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 	}
 
 	batches := make([]traceBatch, 0, len(builders))
-	for id, b := range builders {
+	for _, id := range order {
+		b := builders[id]
 		batches = append(batches, traceBatch{
 			id:        id,
 			hasRoot:   b.hasRoot,
@@ -1247,6 +1321,9 @@ func (tsp *tailSamplingSpanProcessor) Shutdown(context.Context) error {
 	if tsp.doneChan != nil {
 		<-tsp.doneChan
 	}
+	if tsp.spool != nil {
+		return tsp.spool.Stop()
+	}
 	return nil
 }
 
@@ -1296,7 +1373,10 @@ func (tsp *tailSamplingSpanProcessor) releaseSampledTrace(ctx context.Context, i
 		PolicyName: td.PolicyName,
 		Threshold:  td.FinalThreshold,
 	})
-	tsp.forwardSpans(ctx, td.ReceivedBatches)
+	// The spool delivers kept spans from the stored requests.
+	if tsp.spool == nil {
+		tsp.forwardSpans(ctx, td.ReceivedBatches)
+	}
 	_, ok := tsp.sampledIDCache.Get(id)
 	if ok {
 		tsp.dropTrace(id, time.Now())

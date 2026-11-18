@@ -47,9 +47,18 @@ type modelSampler struct {
 	decided map[pcommon.TraceID]bool
 }
 
-func (m *modelSampler) process(r *Record, ids map[pcommon.TraceID]int) {
+func allAssocs(r *Record) []int {
+	idxs := make([]int, len(r.assocs))
+	for i := range idxs {
+		idxs[i] = i
+	}
+	return idxs
+}
+
+func (m *modelSampler) process(r *Record, idxs []int) {
 	m.s.Begin(r)
-	for id, i := range ids {
+	for _, i := range idxs {
+		id := r.assocs[i].ID
 		if keep, ok := m.decided[id]; ok {
 			m.s.Inherit(r, i, keep)
 			continue
@@ -99,11 +108,11 @@ func crash(s *Spool) {
 	}
 }
 
-func makeRequest(r *rand.Rand, traces []pcommon.TraceID, nextSpan *uint64) (ptrace.Traces, []pcommon.TraceID) {
+func makeRequest(r *rand.Rand, traces []pcommon.TraceID, nextSpan *uint64) (ptrace.Traces, []Assoc) {
 	td := ptrace.NewTraces()
-	var ids []pcommon.TraceID
-	seen := map[pcommon.TraceID]bool{}
-	for range 1 + r.IntN(2) {
+	var assocs []Assoc
+	for ri := range 1 + r.IntN(3) {
+		seen := map[pcommon.TraceID]bool{}
 		ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
 		for range 1 + r.IntN(4) {
 			id := traces[r.IntN(len(traces))]
@@ -117,11 +126,11 @@ func makeRequest(r *rand.Rand, traces []pcommon.TraceID, nextSpan *uint64) (ptra
 			span.SetSpanID(sid)
 			if !seen[id] {
 				seen[id] = true
-				ids = append(ids, id)
+				assocs = append(assocs, Assoc{ID: id, Resource: uint32(ri)})
 			}
 		}
 	}
-	return td, ids
+	return td, assocs
 }
 
 func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
@@ -140,7 +149,7 @@ func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
 			}
 			s.Start()
 			for _, rr := range rec.Refeed {
-				m.process(rr.Record, rr.IDs)
+				m.process(rr.Record, rr.Assocs)
 			}
 			return s, m
 		}
@@ -167,11 +176,7 @@ func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
 					m2.Unlock()
 				}
 			}
-			idx := map[pcommon.TraceID]int{}
-			for i, id := range ids {
-				idx[id] = i
-			}
-			m.process(rec, idx)
+			m.process(rec, allAssocs(rec))
 			if r.IntN(4) == 0 {
 				m.tick(r)
 			}
@@ -212,7 +217,7 @@ func snapshot(s *Spool) (map[uint64][]assocState, []memoEntry) {
 			st[i] = a
 			if a == pending || a == unsettled {
 				st[i] = unsettled
-				open[r.ids[i]] = true
+				open[r.assocs[i].ID] = true
 			}
 		}
 		states[seq] = st
@@ -220,6 +225,7 @@ func snapshot(s *Spool) (map[uint64][]assocState, []memoEntry) {
 	var memo []memoEntry
 	for _, e := range s.memo.entries() {
 		if !open[e.ID] {
+			e.seq = 0
 			memo = append(memo, e)
 		}
 	}
@@ -239,12 +245,10 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 
 		// process handles a record like the processor does, with capacity
 		// evictions and size-limit drops in the middle of the record.
-		process := func(rec *Record, ids map[pcommon.TraceID]int) {
+		process := func(rec *Record, idxs []int) {
 			s.Begin(rec)
-			for i, id := range rec.ids {
-				if _, ok := ids[id]; !ok {
-					continue
-				}
+			for _, i := range idxs {
+				id := rec.assocs[i].ID
 				if r.IntN(8) == 0 && len(m.pending) > 0 {
 					for victim := range m.pending {
 						s.Evict(victim)
@@ -279,11 +283,7 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 			require.NoError(t, err)
 			rec, err := s.Register(raw, ids, time.Now())
 			require.NoError(t, err)
-			all := map[pcommon.TraceID]int{}
-			for i, id := range ids {
-				all[id] = i
-			}
-			process(rec, all)
+			process(rec, allAssocs(rec))
 			if r.IntN(3) == 0 {
 				m.tick(r)
 			}
@@ -311,7 +311,7 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 					m.decided[e.ID] = e.Keep
 				}
 				for _, rr := range got.Refeed {
-					process(rr.Record, rr.IDs)
+					process(rr.Record, rr.Assocs)
 				}
 			}
 		}
@@ -336,8 +336,8 @@ func TestSpoolRemovesSegmentsAfterCommit(t *testing.T) {
 		rec, err := s.Register(raw, ids, time.Now())
 		require.NoError(t, err)
 		s.Begin(rec)
-		for i, id := range ids {
-			s.Inherit(rec, i, keepTrace(id))
+		for i, a := range ids {
+			s.Inherit(rec, i, keepTrace(a.ID))
 		}
 	}
 	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, 5*time.Millisecond)
@@ -378,8 +378,12 @@ func TestSpoolIgnoresTornTail(t *testing.T) {
 	require.Len(t, got.Refeed, 1)
 	require.Equal(t, rec.Seq(), got.Refeed[0].Record.Seq())
 	s.Start()
+	require.Len(t, got.Refeed[0].Assocs, len(ids))
 	s.Begin(got.Refeed[0].Record)
-	s.Attach(got.Refeed[0].Record, 0)
+	for _, i := range got.Refeed[0].Assocs {
+		s.Attach(got.Refeed[0].Record, i)
+	}
+	s.End(got.Refeed[0].Record)
 	s.Decide(pcommon.TraceID{4}, true)
 	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, 5*time.Millisecond)
 	require.NoError(t, s.Stop())
@@ -389,11 +393,11 @@ func TestSpoolIgnoresTornTail(t *testing.T) {
 func TestFrameRoundTrip(t *testing.T) {
 	frames := []frame{
 		{kind: frameHeader, seq: 7},
-		{kind: frameRecord, seq: 9, seg: 3, off: 1 << 33, length: 77, arrival: -5, ids: []pcommon.TraceID{{1}, {2}}},
+		{kind: frameRecord, seq: 9, seg: 3, off: 1 << 33, length: 77, arrival: -5, assocs: []Assoc{{ID: pcommon.TraceID{1}, Resource: 3}, {ID: pcommon.TraceID{1}}}},
 		{kind: frameKeep, seq: 4, id: pcommon.TraceID{9}},
 		{kind: frameDrop, seq: 4, id: pcommon.TraceID{9}},
 		{kind: frameEvict, seq: 4, id: pcommon.TraceID{9}},
-		{kind: frameLate, seq: 4, id: pcommon.TraceID{9}, keep: true},
+		{kind: frameLate, seq: 4, idx: 2, keep: true},
 		{kind: frameCommit, seq: 11},
 		{kind: frameWatermark, seq: 12},
 		{kind: frameMemo, id: pcommon.TraceID{5}, keep: true},
@@ -401,9 +405,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	for _, f := range frames {
 		got, err := decodeFrame(f.encode(nil))
 		require.NoError(t, err)
-		if len(f.ids) == 0 && f.kind != frameRecord {
-			got.ids = nil
-		}
+
 		require.Equal(t, f, got)
 	}
 	_, err := decodeFrame([]byte{frameKeep, 1, 2})
