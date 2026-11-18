@@ -38,3 +38,9 @@ The measured staircase and long-run results are in [the benchmark report](RESULT
 ## v0.165.1 and batch retrieval
 
 The [v0.165.1 report](RESULTS-v165.md) compares the published modules with the same release plus upstream changes [#52954](https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/52954) and [#52926](https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/52926). The release and backport binaries are built with `build165.sh` using the separate `v165.mod` file. The storage observer preserves optional interface discovery and records actual single and batch reads. The [run summaries](benchmark-results-v165.json) include those counters and the digest of the sorted export manifest.
+
+## Testing under page-cache pressure
+
+Run `build165.sh` and copy its `batched` binary as `tailcold` into a fresh directory on the ext4 test volume. Copy `benchmark.py` and `pressure.py` alongside it and run `python3 -u pressure.py` there as root. The driver expects Linux cgroup v2 with systemd I/O and memory accounting, the device vdb, and unused loopback ports 14317 and 18888.
+
+Both arms use a 30-second decision wait and a 512 MiB backend cgroup with swap disabled. The driver records cgroup device bytes, device-wide sectors, and sampled RSS. Probe mode measures calling-thread storage read bytes for every nonempty TakeMany and every 32nd raw ReadAt. This includes read-ahead issued by the calling thread. Compare these counters within each arm to establish that retrieval triggered physical reads. They measure different operations across arms. The raw arm uses buffered I/O with normal filesystem writeback.

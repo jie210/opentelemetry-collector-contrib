@@ -72,6 +72,9 @@ type observedMulti struct {
 func (s *observedMulti) TakeMany(ids []pcommon.TraceID) ([]ptrace.Traces, []error) {
 	s.calls.Add(1)
 	s.ids.Add(int64(len(ids)))
+	if *probeReads && len(ids) > 0 {
+		defer readback.begin()()
+	}
 	return s.multi.TakeMany(ids)
 }
 
@@ -100,6 +103,11 @@ func export(s any, ctx context.Context, decode func(any) error, _ grpc.UnaryServ
 	return []byte{}, nil
 }
 
+var decisionWait = flag.Duration("decision-wait", 5*time.Second, "tail sampling decision wait")
+var traceCapacity = flag.Uint64("num-traces", 150000, "pending trace capacity")
+var probeReads = flag.Bool("probe-reads", false, "sample Linux thread storage read_bytes during readback")
+var readback readProbe
+
 func run(mode, dir string) error {
 	return runAt(mode, dir, "127.0.0.1:14317", "127.0.0.1:18888")
 }
@@ -117,8 +125,8 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	a := &audit{w: bufio.NewWriter(f)}
 	fac := tail.NewFactory()
 	cfg := fac.CreateDefaultConfig().(*tail.Config)
-	cfg.DecisionWait = 5 * time.Second
-	cfg.NumTraces = 150000
+	cfg.DecisionWait = *decisionWait
+	cfg.NumTraces = *traceCapacity
 	cfg.BlockOnOverflow = true
 	var policy tail.PolicyCfg
 	policy.Name = "keep-errors"
@@ -212,6 +220,12 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		stats := map[string]any{"accepted": accepted.Load(), "decided": decided.Load(), "requests": requests.Load()}
+		if *probeReads {
+			stats["probed_calls"] = readback.calls.Load()
+			stats["probed_cold_calls"] = readback.cold.Load()
+			stats["probed_read_bytes"] = readback.bytes.Load()
+			stats["probe_errors"] = readback.errors.Load()
+		}
 		if single != nil {
 			stats["single_take"] = single.calls.Load()
 		}

@@ -172,7 +172,15 @@ func (s *spool) finish(r *record) {
 	}
 	if len(r.keep) > 0 {
 		raw := make([]byte, r.length)
-		if _, err := r.seg.file.ReadAt(raw, r.offset); err != nil {
+		var stop func()
+		if *probeReads && s.reads%32 == 0 {
+			stop = readback.begin()
+		}
+		_, err := r.seg.file.ReadAt(raw, r.offset)
+		if stop != nil {
+			stop()
+		}
+		if err != nil {
 			s.err = err
 			return
 		}
