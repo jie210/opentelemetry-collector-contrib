@@ -3,7 +3,7 @@
 
 // Package rawrequest passes the original OTLP request bytes from the tail
 // spool receiver to the tail sampling processor within one ConsumeTraces call.
-package rawrequest // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/rawrequest"
+package rawrequest // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/rawrequest"
 
 import (
 	"context"
