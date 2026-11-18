@@ -1,0 +1,40 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+        max_recv_msg_size_mib: 64
+
+processors:
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 200000
+    expected_new_traces_per_sec: 20000
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 100}
+      - name: sample
+        type: probabilistic
+        probabilistic: {sampling_percentage: 10}
+
+exporters:
+  otlp:
+    endpoint: 127.0.0.1:5317
+    tls: {insecure: true}
+    timeout: 10s
+    sending_queue:
+      enabled: ${env:EXPORT_QUEUE}
+      queue_size: 200000
+
+service:
+  telemetry:
+    logs: {level: info}
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling]
+      exporters: [otlp]
