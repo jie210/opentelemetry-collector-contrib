@@ -100,3 +100,11 @@ func TestRecoveryWithPartialDecisionAndTornTail(t *testing.T) {
 		t.Fatal("duplicate replay")
 	}
 }
+
+func statusSpan(spans ptrace.SpanSlice, id traceID, isError bool) {
+	p := spans.AppendEmpty()
+	p.SetTraceID(id)
+	if isError {
+		p.Status().SetCode(ptrace.StatusCodeError)
+	}
+}

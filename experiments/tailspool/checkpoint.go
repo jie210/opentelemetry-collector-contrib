@@ -89,7 +89,7 @@ func (s *spool) checkpoint() error {
 		b = le.AppendUint32(b, uint32(r.length))
 		for i := 0; i < len(r.fields); i += 17 {
 			id := traceID(r.fields[i : i+16])
-			flags := r.fields[i+16] & 1
+			flags := r.fields[i+16] &^ 6
 			if r.keep[id] {
 				flags |= 2
 			} else if !slices.Contains(s.index[id], r) {

@@ -4,18 +4,16 @@
 package main
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
+
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
@@ -77,24 +75,6 @@ func (g *startupGate) activate(s *spool, h endpoint) (spans, batches int, err er
 	}
 }
 
-func (s *spool) resolve(id traceID, now int64) {
-	keep, ok := s.recovering[id]
-	if !ok {
-		return
-	}
-	lag := now - s.index[id][0].due
-	c := observedCache{s.no, s, false}
-	if keep {
-		c = observedCache{s.yes, s, true}
-	}
-	if s.err == nil {
-		s.err = s.journal.decision(id, keep)
-	}
-	c.apply(id, cache.DecisionMetadata{})
-	delete(s.recovering, id)
-	s.restoredDone++
-	s.maxLateness = max(s.maxLateness, lag)
-}
 func (s *spool) adopt(path string) (int, error) {
 	id, err := strconv.ParseInt(strings.TrimSuffix(filepath.Base(path), ".inbox"), 10, 64)
 	if err != nil {
@@ -111,14 +91,13 @@ func (s *spool) adopt(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, ids := projection(td)
+	parts, err := s.plan.split(td)
+	if err != nil {
+		return 0, err
+	}
+	ids := partIDs(parts)
 	if len(ids) == 0 {
 		return 0, os.Remove(path)
-	}
-	for k := range ids {
-		if _, ok := s.recovering[k]; ok && s.index[k][0].due <= id {
-			s.resolve(k, id)
-		}
 	}
 	if s.err != nil {
 		return 0, s.err
@@ -133,13 +112,14 @@ func (s *spool) adopt(path string) (int, error) {
 	}
 	seg := &segment{file: f, number: s.next, size: int64(len(raw))}
 	s.next++
-	r := &record{inbox: id, due: id + int64(*decisionWait), seg: seg, length: len(raw)}
-	if err = s.journal.appendRecord(s, r, ids); err != nil {
+	r := &record{inbox: id, due: id + int64(s.wait), seg: seg, length: len(raw)}
+	if err = s.journal.appendRecord(s, r, ids, parts); err != nil {
 		return 0, err
 	}
-	for k, e := range ids {
+	s.attach(r, parts)
+	for k := range ids {
 		if len(s.index[k]) > 0 {
-			s.recovering[k] = s.recovering[k] || e
+			s.recovering[k] = true
 		}
 	}
 	if r.pending == 0 {
@@ -151,71 +131,47 @@ func (s *spool) adopt(path string) (int, error) {
 	return td.SpanCount(), os.Remove(path)
 }
 
-// New batches for a recovering trace contribute to the same pending decision.
-// Once the original deadline passes the decision is cached before registration.
-func (s *spool) ingest(raw []byte, ids map[traceID]bool, td ptrace.Traces) error {
+func partIDs(parts map[traceID]tracePart) map[traceID]bool {
+	ids := make(map[traceID]bool, len(parts))
+	for id := range parts {
+		ids[id] = false
+	}
+	return ids
+}
+func (s *spool) ingestView(ctx context.Context, raw []byte, td ptrace.Traces) error {
+	parts, e := s.plan.split(td)
+	if e != nil || len(parts) == 0 {
+		return e
+	}
+	ids := partIDs(parts)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UnixNano()
-	for id := range ids {
-		if _, ok := s.recovering[id]; ok {
-			if s.index[id][0].due <= now {
-				s.resolve(id, now)
+	for s.capacity > 0 && s.err == nil && len(s.index) > 0 && uint64(len(s.index)+len(ids)) > s.capacity {
+		extra := 0
+		for id := range ids {
+			if len(s.index[id]) == 0 {
+				if _, ok := s.yes.Get(id); ok {
+					continue
+				}
+				if _, ok := s.no.Get(id); !ok {
+					extra++
+				}
 			}
 		}
-	}
-	if err := s.appendLocked(raw, ids); err != nil {
-		return err
-	}
-	if len(s.recovering) > 0 {
-		for id, e := range ids {
-			if old, ok := s.recovering[id]; ok {
-				s.recovering[id] = old || e
-			}
-		}
-		for _, rs := range td.ResourceSpans().All() {
-			for _, ss := range rs.ScopeSpans().All() {
-				ss.Spans().RemoveIf(func(p ptrace.Span) bool { _, ok := s.recovering[p.TraceID()]; return ok })
-			}
-		}
-	}
-	return nil
-}
-
-type dueTrace struct {
-	id  traceID
-	due int64
-}
-
-func (s *spool) schedule() []dueTrace {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	items := make([]dueTrace, 0, len(s.recovering))
-	for id := range s.recovering {
-		items = append(items, dueTrace{id, s.index[id][0].due})
-	}
-	slices.SortFunc(items, func(a, b dueTrace) int { return cmp.Compare(a.due, b.due) })
-	return items
-}
-func (s *spool) expire(ctx context.Context, items []dueTrace) {
-	for i := 0; i < len(items); {
-		if ctx.Err() != nil {
-			return
-		}
-		if d := time.Until(time.Unix(0, items[i].due)); d > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(d):
-			}
-		}
-		s.mu.Lock()
-		now := time.Now().UnixNano()
-		end := min(i+32, len(items))
-		for i < end && items[i].due <= now {
-			s.resolve(items[i].id, now)
-			i++
+		if extra == 0 || uint64(len(s.index)+extra) <= s.capacity {
+			break
 		}
 		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+		s.mu.Lock()
 	}
+	defer s.mu.Unlock()
+	if e = s.appendLocked(raw, ids, parts); e != nil {
+		return e
+	}
+	s.attach(s.journal.live[s.journal.seq], parts)
+	return nil
 }

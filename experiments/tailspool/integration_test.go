@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -28,7 +29,23 @@ func TestBackendChild(t *testing.T) {
 	if os.Getenv("SPOOL_TEST_DIR") == "" {
 		t.Skip("subprocess helper")
 	}
-	if err := runAt(os.Getenv("SPOOL_TEST_MODE"), os.Getenv("SPOOL_TEST_DIR"), os.Getenv("SPOOL_TEST_RPC"), os.Getenv("SPOOL_TEST_STATS")); err != nil {
+	var observe func(traceID, bool)
+	if config := os.Getenv("SPOOL_TEST_CONFIG"); config != "" {
+		*configPath = config
+		*decisionWait = 3 * time.Second
+		*checkpointBytes = 32 << 10
+		f, err := os.OpenFile(filepath.Join(os.Getenv("SPOOL_TEST_DIR"), "decisions"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		observe = func(id traceID, keep bool) {
+			if _, e := fmt.Fprintf(f, "%x %t\n", id[:], keep); e != nil {
+				panic(e)
+			}
+		}
+	}
+	if err := runObserved(os.Getenv("SPOOL_TEST_MODE"), os.Getenv("SPOOL_TEST_DIR"), os.Getenv("SPOOL_TEST_RPC"), os.Getenv("SPOOL_TEST_STATS"), observe); err != nil {
 		t.Fatal(err)
 	}
 }

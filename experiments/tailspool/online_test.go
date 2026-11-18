@@ -24,8 +24,13 @@ func TestCheckpointRestoreDeadlineAndIngress(t *testing.T) {
 		}
 		a := &audit{w: bufio.NewWriter(f)}
 		s := newSpool(dir, a.consume, newDecisionLRU(), newDecisionLRU())
+		s.plan = projectionPlan{statusOnly: true}
+		s.views = map[traceID]*pendingTrace{}
 		s.recovering, e = s.recover(f, a)
 		if e != nil {
+			t.Fatal(e)
+		}
+		if e = s.rebuildViews(); e != nil {
 			t.Fatal(e)
 		}
 		return s, f
@@ -70,21 +75,20 @@ func TestCheckpointRestoreDeadlineAndIngress(t *testing.T) {
 	// A post-deadline ERROR stays dropped. A pre-deadline ERROR updates the
 	// recovering trace, without starting an independent upstream decision.
 	for _, n := range []int{1, 2} {
-		b, summary, ids := raw(n, true)
-		if e := s.ingest(b, ids, summary); e != nil {
+		b, _, _ := raw(n, true)
+		td, e := (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces(b)
+		if e != nil {
 			t.Fatal(e)
 		}
-		if n == 2 && summary.SpanCount() != 0 {
-			t.Fatal("dispatched recovering trace twice")
+		if e = s.ingestView(t.Context(), b, td); e != nil {
+			t.Fatal(e)
 		}
 	}
-	if _, ok := s.no.Get(tid(1)); !ok {
-		t.Fatal("late error changed expired trace")
+	if s.views[tid(1)].statuses != 1 || s.views[tid(2)].statuses != 5 {
+		t.Fatal("cutoff or status projection lost")
 	}
-	if !s.recovering[tid(2)] {
-		t.Fatal("pre-expiry error lost")
-	}
-	s.resolve(tid(2), future)
+	observedCache{s.no, s, false}.Put(tid(1), cache.DecisionMetadata{})
+	observedCache{s.yes, s, true}.Put(tid(2), cache.DecisionMetadata{})
 	if s.journal.audit.count != 3 {
 		t.Fatalf("exported %d", s.journal.audit.count)
 	}
@@ -121,7 +125,7 @@ func TestCheckpointRestoreDeadlineAndIngress(t *testing.T) {
 	if len(s.index[tid(4)]) != 1 {
 		t.Fatal("inbox adopted twice")
 	}
-	s.resolve(tid(4), time.Now().Add(*decisionWait).UnixNano())
+	observedCache{s.yes, s, true}.Put(tid(4), cache.DecisionMetadata{})
 	if s.journal.audit.count != 4 {
 		t.Fatal("missing staged output")
 	}

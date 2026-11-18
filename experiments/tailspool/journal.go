@@ -47,7 +47,7 @@ func (j *journal) frame(b []byte) error {
 	_, err := j.w.Write(b)
 	return err
 }
-func (j *journal) appendRecord(s *spool, r *record, ids map[traceID]bool) error {
+func (j *journal) appendRecord(s *spool, r *record, ids map[traceID]bool, parts map[traceID]tracePart) error {
 	j.seq++
 	r.seq = j.seq
 	b := make([]byte, 0, 17+17*len(ids))
@@ -62,6 +62,9 @@ func (j *journal) appendRecord(s *spool, r *record, ids map[traceID]bool) error 
 	for id, e := range ids {
 		b = append(b, id[:]...)
 		var flags byte
+		if p := parts[id]; len(p.wire) == 0 {
+			flags = p.statuses << 3
+		}
 		if e {
 			flags = 1
 		}
@@ -185,7 +188,7 @@ func (s *spool) recover(output *os.File, a *audit) (map[traceID]bool, error) {
 	records := make(map[uint64]*record)
 	j.live = records
 	j.adopted = make(map[int64]bool)
-	legacyDue := time.Now().Add(*decisionWait).UnixNano()
+	legacyDue := time.Now().Add(s.wait).UnixNano()
 	segments := make(map[int]*segment)
 	pending := make(map[traceID]bool)
 	var count int64

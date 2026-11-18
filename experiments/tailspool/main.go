@@ -107,6 +107,7 @@ func export(s any, ctx context.Context, decode func(any) error, _ grpc.UnaryServ
 }
 
 var decisionWait = flag.Duration("decision-wait", 5*time.Second, "tail sampling decision wait")
+var configPath = flag.String("config", "", "Collector YAML containing processors.tail_sampling.policies")
 var traceCapacity = flag.Uint64("num-traces", 150000, "pending trace capacity")
 var probeReads = flag.Bool("probe-reads", false, "sample Linux thread storage read_bytes during readback")
 var readback readProbe
@@ -122,6 +123,9 @@ func listenRPC(addr string, h endpoint) (*grpc.Server, net.Listener, error) {
 	return g, l, e
 }
 func runAt(mode, dir, rpcAddr, statsAddr string) error {
+	return runObserved(mode, dir, rpcAddr, statsAddr, nil)
+}
+func runObserved(mode, dir, rpcAddr, statsAddr string, decision func(traceID, bool)) error {
 	ctx := context.Background()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -141,11 +145,10 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	cfg.DecisionWait = *decisionWait
 	cfg.NumTraces = *traceCapacity
 	cfg.BlockOnOverflow = true
-	var policy tail.PolicyCfg
-	policy.Name = "keep-errors"
-	policy.Type = tail.StatusCode
-	policy.StatusCodeCfg.StatusCodes = []string{"ERROR"}
-	cfg.PolicyCfgs = []tail.PolicyCfg{policy}
+	err = configureSampling(*configPath, cfg)
+	if err != nil {
+		return err
+	}
 	yes, _ := cache.NewLRUDecisionCache(150000)
 	no, _ := cache.NewLRUDecisionCache(150000)
 	h := host{componenttest.NewNopHost(), make(map[component.ID]component.Component)}
@@ -191,26 +194,31 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	switch mode {
 	case "raw", "raw-sync", "compact":
 		sp = newSpool(dir, a.consume, yes, no)
+		sp.plan = derive(cfg.PolicyCfgs)
 		sp.syncSegments = mode == "raw-sync"
 		if mode == "compact" {
 			sp.limit = 16 << 20
 			sp.syncSegments = true
-			if err = featuregate.GlobalRegistry().Set("processor.tailsamplingprocessor.tailstorageextension", true); err != nil {
-				return err
-			}
-			id := component.MustNewID("compact")
-			h.extensions[id] = &errorStore{errors: map[traceID]bool{}}
-			cfg.TailStorageID = &id
+			sp.wait = cfg.DecisionWait
+			sp.capacity = cfg.NumTraces
+			sp.views = make(map[traceID]*pendingTrace)
+			// The spool owns the configured collection window. Submit complete views
+			// to the same official sampler for both live and recovered decisions.
+			cfg.DecisionWait = time.Second
 			restored, err = sp.recover(f, a)
 			if err != nil {
 				return err
 			}
 			defer func() { sp.journal.f.Close() }()
 			sp.recovering = restored
+			if err = sp.rebuildViews(); err != nil {
+				return err
+			}
 		}
 		yes = observedCache{yes, sp, true}
 		no = observedCache{no, sp, false}
 		sink = func(context.Context, ptrace.Traces) error { return nil }
+	case "official": // The same processor, with its default storage and complete input.
 	case "pebble":
 		if err = featuregate.GlobalRegistry().Set("processor.tailsamplingprocessor.tailstorageextension", true); err != nil {
 			return err
@@ -237,8 +245,15 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
-	hook := func(context.Context, traceID, *tail.TraceData) { decided.Add(1) }
-	cfg.Options = []tail.Option{tail.WithSampledDecisionCache(yes), tail.WithNonSampledDecisionCache(no), tail.WithSampledHooks(hook), tail.WithNonSampledHooks(hook)}
+	hook := func(keep bool) tail.DecisionHook {
+		return func(_ context.Context, id traceID, _ *tail.TraceData) {
+			decided.Add(1)
+			if decision != nil {
+				decision(id, keep)
+			}
+		}
+	}
+	cfg.Options = []tail.Option{tail.WithSampledDecisionCache(yes), tail.WithNonSampledDecisionCache(no), tail.WithSampledHooks(hook(true)), tail.WithNonSampledHooks(hook(false))}
 	c, err := consumer.NewTraces(sink)
 	if err != nil {
 		return err
@@ -257,25 +272,34 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 			return err
 		}
 		n := td.SpanCount()
-		if sp != nil {
-			summary, ids := projection(td)
-			if mode == "compact" {
-				err = sp.ingest(raw, ids, summary)
-			} else {
-				err = sp.append(raw, ids)
-			}
-			if err != nil {
+		if mode == "compact" {
+			if err = sp.ingestView(ctx, raw, td); err != nil {
 				return err
 			}
-			td = summary
-		}
-		if err = sampler.ConsumeTraces(ctx, td); err != nil {
-			return err
+		} else {
+			if sp != nil {
+				summary, ids, e := sp.plan.immediate(td)
+				if e != nil {
+					return e
+				}
+				if err = sp.append(raw, ids); err != nil {
+					return err
+				}
+				td = summary
+			}
+			if err = sampler.ConsumeTraces(ctx, td); err != nil {
+				return err
+			}
 		}
 		accepted.Add(int64(n))
 		requests.Add(1)
 		return nil
 	})
+	m, err := net.Listen("tcp", statsAddr)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
 	var stopRecovery context.CancelFunc
 	var recoveryDone chan struct{}
 	if mode == "compact" {
@@ -285,21 +309,17 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		}
 		accepted.Add(int64(n))
 		requests.Add(int64(k))
-		items := sp.schedule()
+
 		var rctx context.Context
 		rctx, stopRecovery = context.WithCancel(ctx)
 		recoveryDone = make(chan struct{})
-		go func() { defer close(recoveryDone); sp.expire(rctx, items) }()
+		go func() { defer close(recoveryDone); sp.dispatch(rctx, sampler.ConsumeTraces) }()
 	} else {
 		g, l, err = listenRPC(rpcAddr, handler)
 		if err != nil {
 			return err
 		}
 		go func() { errs <- g.Serve(l) }()
-	}
-	m, err := net.Listen("tcp", statsAddr)
-	if err != nil {
-		return err
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
@@ -362,6 +382,9 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	if stopRecovery != nil {
 		stopRecovery()
 		<-recoveryDone
+		if e := sp.submitDue(ctx, true, sampler.ConsumeTraces); e != nil {
+			err = errors.Join(err, e)
+		}
 	}
 	stopErr := sampler.Shutdown(ctx)
 	_ = web.Close()

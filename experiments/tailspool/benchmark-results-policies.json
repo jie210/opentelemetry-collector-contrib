@@ -1,0 +1,165 @@
+{
+  "decision_parity": {
+    "OTTL-same-span": {
+      "keep": 128,
+      "drop": 384,
+      "exported_spans": 288
+    },
+    "count-flags-state-probability": {
+      "keep": 172,
+      "drop": 340,
+      "exported_spans": 384
+    },
+    "attribute-combination": {
+      "keep": 200,
+      "drop": 312,
+      "exported_spans": 450
+    },
+    "status-OK": {
+      "keep": 256,
+      "drop": 256,
+      "exported_spans": 576
+    }
+  },
+  "parity_log": "=== RUN   TestPolicyParity\n=== RUN   TestPolicyParity/status-OK\n=== PAUSE TestPolicyParity/status-OK\n=== RUN   TestPolicyParity/attribute-combination\n=== PAUSE TestPolicyParity/attribute-combination\n=== RUN   TestPolicyParity/OTTL-same-span\n=== PAUSE TestPolicyParity/OTTL-same-span\n=== RUN   TestPolicyParity/count-flags-state-probability\n=== PAUSE TestPolicyParity/count-flags-state-probability\n=== CONT  TestPolicyParity/status-OK\n=== CONT  TestPolicyParity/OTTL-same-span\n=== CONT  TestPolicyParity/count-flags-state-probability\n=== CONT  TestPolicyParity/attribute-combination\n=== NAME  TestPolicyParity/OTTL-same-span\n    policy_parity_test.go:270: official keep=128 drop=384 full exported spans=288\n=== NAME  TestPolicyParity/count-flags-state-probability\n    policy_parity_test.go:270: official keep=172 drop=340 full exported spans=384\n=== NAME  TestPolicyParity/attribute-combination\n    policy_parity_test.go:270: official keep=200 drop=312 full exported spans=450\n=== NAME  TestPolicyParity/status-OK\n    policy_parity_test.go:270: official keep=256 drop=256 full exported spans=576\n--- PASS: TestPolicyParity (0.00s)\n    --- PASS: TestPolicyParity/attribute-combination (27.17s)\n    --- PASS: TestPolicyParity/OTTL-same-span (27.17s)\n    --- PASS: TestPolicyParity/status-OK (27.17s)\n    --- PASS: TestPolicyParity/count-flags-state-probability (28.17s)\n=== RUN   TestProjectionRetainsTypedValuesWithoutMatching\n--- PASS: TestProjectionRetainsTypedValuesWithoutMatching (0.00s)\nPASS\n",
+  "policy_yaml": "processors:\n  tail_sampling:\n    decision_wait: 30s\n    num_traces: 500000\n    block_on_overflow: true\n    num_shards: 1\n    sampling_strategy: trace-complete\n    tail_storage: compact\n    policies:\n      - name: keep-errors\n        type: status_code\n        status_code:\n          status_codes: [ERROR]\n",
+  "binary_sha256": "ddb85764e36d7c144fce02b8be3c58eca435d3b013120bfbe9ee4131b179a81a",
+  "stress": {
+    "target_spans_s": 24576,
+    "duration_s": 155,
+    "attempted_batches": 29760,
+    "acknowledged_batches": 29703,
+    "failed_batches": 57,
+    "kill_ns": 1794993238890492122,
+    "last_ack_ns": 1794993238889399414,
+    "first_ack_ns": 1794993239194680734,
+    "gap_ms": 305.28132,
+    "kill_to_ack_ms": 304.188612,
+    "worst_ack_gap_around_kill_ms": 305.28132,
+    "post_kill_call_ack_ms": 304.188612,
+    "ack_spans_s_30s_windows": [
+      24576.0,
+      24328.533333333333,
+      24541.866666666665
+    ],
+    "wal_checkpoint_sizes": [
+      [
+        8217937,
+        5377174
+      ],
+      [
+        13730586,
+        6421744
+      ],
+      [
+        14637280,
+        6209006
+      ],
+      [
+        14456104,
+        6158412
+      ]
+    ],
+    "expected_acked": 38024,
+    "actual": 38024,
+    "missing_acked": 0,
+    "extra_acked": 0,
+    "ambiguous_exports": 0,
+    "unexpected": 0,
+    "before": {
+      "time_ns": 1794993238881549572,
+      "wal_bytes": 13028911,
+      "accepted": 1896448,
+      "appends": 14816,
+      "checkpoints": 1,
+      "decided": 281600,
+      "max_recovery_lag_ms": 0,
+      "pending_ids": 192512,
+      "probe_errors": 0,
+      "probed_calls": 88,
+      "probed_cold_calls": 88,
+      "probed_read_bytes": 57344000,
+      "read": 1504633856,
+      "reads": 2816,
+      "recovered_decisions": 0,
+      "recovering": 0,
+      "requests": 14816,
+      "restored_ids": 0,
+      "sent": 11264,
+      "staged": 0,
+      "written": 7916405708
+    },
+    "first_recovery_sample": {
+      "time_ns": 1794993240144356127,
+      "wal_bytes": 13138616,
+      "accepted": 23424,
+      "appends": 40,
+      "checkpoints": 1,
+      "decided": 0,
+      "max_recovery_lag_ms": 0,
+      "pending_ids": 198432,
+      "probe_errors": 0,
+      "probed_calls": 0,
+      "probed_cold_calls": 0,
+      "probed_read_bytes": 0,
+      "read": 0,
+      "reads": 0,
+      "recovered_decisions": 0,
+      "recovering": 197152,
+      "requests": 183,
+      "restored_ids": 192576,
+      "sent": 11264,
+      "staged": 143,
+      "written": 21372586
+    },
+    "last_recovery_sample": {
+      "time_ns": 1794993272017376472,
+      "wal_bytes": 14550945,
+      "accepted": 806656,
+      "appends": 6160,
+      "checkpoints": 2,
+      "decided": 202678,
+      "max_recovery_lag_ms": 4885,
+      "pending_ids": 191591,
+      "probe_errors": 0,
+      "probed_calls": 64,
+      "probed_cold_calls": 58,
+      "probed_read_bytes": 32366592,
+      "read": 1081455584,
+      "reads": 2024,
+      "recovered_decisions": 197151,
+      "recovering": 1,
+      "requests": 6302,
+      "restored_ids": 192576,
+      "sent": 19360,
+      "staged": 143,
+      "written": 3291378182
+    },
+    "final": {
+      "accepted": 1905280,
+      "appends": 14742,
+      "checkpoints": 4,
+      "decided": 668896,
+      "max_recovery_lag_ms": 4885,
+      "pending_ids": 0,
+      "probe_errors": 0,
+      "probed_calls": 210,
+      "probed_cold_calls": 199,
+      "probed_read_bytes": 120270848,
+      "read": 3574574040,
+      "reads": 6690,
+      "recovered_decisions": 197152,
+      "recovering": 0,
+      "requests": 14885,
+      "restored_ids": 192576,
+      "sent": 38024,
+      "staged": 143,
+      "written": 7876866424
+    },
+    "restarts": 1,
+    "wal_bytes": 14690246,
+    "first_new_process_call_ack_ms": 304.188612,
+    "memory_peak_bytes": 537571328,
+    "memory_events": "low 0\nhigh 0\nmax 82151\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 912\n"
+  }
+}

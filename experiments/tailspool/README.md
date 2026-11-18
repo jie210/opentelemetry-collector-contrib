@@ -4,7 +4,7 @@ This standalone Go module pins the public tail-sampling processor and Pebble ext
 
 ## Data path
 
-The gRPC codec owns a copy of the decompressed protobuf request while the handler decodes it. In raw mode the handler appends the original bytes to a 64 MiB segment, associates each distinct trace ID with the record's file, offset and length, and passes a new projection to the official processor. The projection contains trace ID, span ID, parent span ID and status code. The experiment fixes the policy to keep traces containing ERROR.
+The gRPC codec owns a copy of the decompressed protobuf request while the handler decodes it. In raw mode the handler appends the original bytes to a 64 MiB segment, associates each distinct trace ID with the record's file, offset and length, and passes a new projection to the official processor. The default policy keeps traces containing ERROR. With a policy configuration file the projection follows the selected policies.
 
 The decision-cache wrappers publish the official keep/drop decisions under the same lock used to register incoming records. Each record becomes eligible for release once all its trace IDs have decisions. A record with any kept IDs is read once, decoded, filtered at the span level and sent to the verifier. An entirely dropped record only releases a reference. A late record inherits decisions still present in the cache. Sealed segments are unlinked once all their records have been processed.
 
@@ -45,11 +45,32 @@ Run `build165.sh` and copy its `batched` binary as `tailcold` into a fresh direc
 
 Both arms use a 30-second decision wait and a 512 MiB backend cgroup with swap disabled. The driver records cgroup device bytes, device-wide sectors, and sampled RSS. Probe mode measures calling-thread storage read bytes for every nonempty TakeMany and every 32nd raw ReadAt. This includes read-ahead issued by the calling thread. Compare these counters within each arm to establish that retrieval triggered physical reads. They measure different operations across arms. The raw arm uses buffered I/O with normal filesystem writeback.
 
-## Compact ERROR policy state and process restart
+## Policy projection and process restart
 
-The `compact` arm retains the official sampler and its decision caches. A tail storage extension combines the ERROR predicate across incoming batches of each trace. While a trace is pending, this store only retains the IDs for which it has seen ERROR. At decision time it constructs one minimal span per trace for the official evaluator. The original request stays in the sequential segments, and the export path reads the complete OTLP bytes. Other sampling policies require their own sufficient state.
+Use `-mode=compact -config collector.yaml` to select policies from the normal `processors.tail_sampling.policies` list. The field plan is derived at startup. For example:
 
-The metadata journal orders request registration, decisions, and local sink commits under the spool lock. Each registration records the segment number, byte range, trace IDs, error flags, and any decision inherited by a late batch. The raw write and the registration reach the kernel before the gRPC handler acknowledges the request. A local sink commit names both the input record and the durable-in-process-crash manifest boundary. Before unlinking a completed segment, the backend flushes its journal. Recovery ignores an incomplete trailing frame, verifies frame checksums, removes uncommitted manifest output, and rebuilds the pending index and decision caches before serving new traffic. Timestamped registrations persist the original expiry. During recovery an ERROR-only deadline worker resolves pending IDs and merges pre-expiry arrivals for those IDs. Fresh traces continue through the official sampler. Legacy registrations without timestamps use a new window when first recovered.
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 500000
+    policies:
+      - name: important-services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: [checkout, payments]
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+```
+
+Attribute policies select the configured keys on both resources and spans, copying the original value and OTLP type. Latency selects timestamps, trace flags and trace state select the corresponding fields, and span-count policies retain span multiplicity. Nested policies select the union of their dependencies. A pure status-code list uses a mask of observed OTLP enum values. Values, regexes, thresholds, negation and policy precedence are evaluated by the official processor. For OTTL, byte-sensitive and unrecognized policies the whole list uses full-input evaluation. In that case pending traces reference raw records on disk, and the backend reads the complete input at evaluation time. Extension policies require their evaluator to be installed in the host.
+
+The journal records raw segment positions, inherited decisions and sink commits. For status-only input it also records the observed status mask. At restart other key projections are rebuilt from each live raw record, or directly from its index when using full-input evaluation. Fresh and recovered traces share one deadline queue and official sampler. At the original cutoff the spool freezes the decision input; later records inherit the decision. Ready traces enter the processor with a one-second decision batch interval, so the decision and export can follow the cutoff by additional ticks. With an unmodified upstream processor, near-boundary arrivals, rate limits and batch-order-sensitive policies may depend on tick timing. Legacy registrations without timestamps use a fresh window. The compact harness supports a single trace-complete pipeline with blocking overflow. It can read the prior experimental settings for `decision_wait`, `num_traces`, `sampling_strategy`, `block_on_overflow`, `num_shards: 1` and `tail_storage: compact`.
+
+The decision-cache hook supplies the trace ID. Once every trace in a record has a decision, the spool reads that original OTLP record if needed, retains all spans of kept traces and passes them to the downstream verification consumer. A restart truncates uncommitted local sink output and restores the committed decisions before applying new ones.
 
 This prototype targets backend process death on the same filesystem. It relies on the kernel surviving SIGKILL. The hash sink can roll back to a byte offset. An external Kafka exporter needs its own atomic or idempotent delivery protocol. A checkpoint rewrites live records, their original deadlines, both late-decision caches and the committed output position into a checksummed snapshot. Atomic rename turns this file into the new append log. The default threshold is 16 MiB of additional metadata. Snapshot size depends on the live working set. The writer holds the spool mutex while taking the checkpoint. Raw segments are reclaimed as their records finish.
 

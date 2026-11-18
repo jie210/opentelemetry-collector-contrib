@@ -33,6 +33,11 @@ type record struct {
 	keep            map[traceID]bool
 }
 type spool struct {
+	wait                          time.Duration
+	capacity                      uint64
+	plan                          projectionPlan
+	views                         map[traceID]*pendingTrace
+	deadlines                     deadlineQueue
 	journal                       *journal
 	recovering                    map[traceID]bool
 	restoredDone                  int64
@@ -51,7 +56,7 @@ type spool struct {
 }
 
 func newSpool(dir string, sink func(ptrace.Traces) error, yes, no cache.Cache) *spool {
-	return &spool{dir: dir, limit: 64 << 20, index: make(map[traceID][]*record), sink: sink, yes: yes, no: no}
+	return &spool{wait: *decisionWait, dir: dir, limit: 64 << 20, index: make(map[traceID][]*record), sink: sink, yes: yes, no: no}
 }
 
 // The fixed ERROR policy examines span status only. Keep grouping IDs and parent
@@ -78,9 +83,9 @@ func projection(td ptrace.Traces) (ptrace.Traces, map[traceID]bool) {
 func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.appendLocked(raw, ids)
+	return s.appendLocked(raw, ids, nil)
 }
-func (s *spool) appendLocked(raw []byte, ids map[traceID]bool) error {
+func (s *spool) appendLocked(raw []byte, ids map[traceID]bool, parts map[traceID]tracePart) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -109,7 +114,7 @@ func (s *spool) appendLocked(raw []byte, ids map[traceID]bool) error {
 		}
 	}
 	g := s.current
-	r := &record{due: time.Now().Add(*decisionWait).UnixNano(), seg: g, offset: g.size, length: len(raw)}
+	r := &record{due: time.Now().Add(s.wait).UnixNano(), seg: g, offset: g.size, length: len(raw)}
 	n, err := g.file.Write(raw)
 	g.size += int64(n)
 	if err != nil || n != len(raw) {
@@ -120,7 +125,7 @@ func (s *spool) appendLocked(raw []byte, ids map[traceID]bool) error {
 		return err
 	}
 	if s.journal != nil {
-		if err = s.journal.appendRecord(s, r, ids); err != nil {
+		if err = s.journal.appendRecord(s, r, ids, parts); err != nil {
 			s.err = err
 			return err
 		}
@@ -187,6 +192,11 @@ func (c observedCache) Put(id traceID, m cache.DecisionMetadata) {
 	defer s.mu.Unlock()
 	if s.journal != nil && !s.journal.replay && s.err == nil {
 		s.err = s.journal.decision(id, c.keep)
+	}
+	if _, ok := s.recovering[id]; ok && len(s.index[id]) > 0 {
+		s.maxLateness = max(s.maxLateness, time.Now().UnixNano()-s.index[id][0].due)
+		delete(s.recovering, id)
+		s.restoredDone++
 	}
 	c.apply(id, m)
 }
