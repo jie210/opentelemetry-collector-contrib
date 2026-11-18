@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/extension/extensiontest"
 	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/processor/processortest"
 	"google.golang.org/grpc"
@@ -41,6 +42,38 @@ type host struct {
 }
 
 func (h host) GetExtensions() map[component.ID]component.Component { return h.extensions }
+
+// Preserve optional method discovery while counting the actual storage calls.
+type singleStore interface {
+	component.Component
+	Append(pcommon.TraceID, ptrace.Traces) error
+	Take(pcommon.TraceID) (ptrace.Traces, error)
+	Delete(pcommon.TraceID) error
+}
+type multiStore interface {
+	TakeMany([]pcommon.TraceID) ([]ptrace.Traces, []error)
+}
+type observedSingle struct {
+	singleStore
+	calls atomic.Int64
+}
+
+func (s *observedSingle) Take(id pcommon.TraceID) (ptrace.Traces, error) {
+	s.calls.Add(1)
+	return s.singleStore.Take(id)
+}
+
+type observedMulti struct {
+	*observedSingle
+	multi      multiStore
+	calls, ids atomic.Int64
+}
+
+func (s *observedMulti) TakeMany(ids []pcommon.TraceID) ([]ptrace.Traces, []error) {
+	s.calls.Add(1)
+	s.ids.Add(int64(len(ids)))
+	return s.multi.TakeMany(ids)
+}
 
 // Both arms use the same transport and take ownership of the decompressed
 // request before grpc-go can release its receive buffer.
@@ -96,6 +129,8 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	no, _ := cache.NewLRUDecisionCache(150000)
 	h := host{componenttest.NewNopHost(), make(map[component.ID]component.Component)}
 	var sp *spool
+	var single *observedSingle
+	var multi *observedMulti
 	var decided, accepted, requests atomic.Int64
 	sink := func(_ context.Context, t ptrace.Traces) error { return a.consume(t) }
 	switch mode {
@@ -121,7 +156,12 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		}
 		defer ext.Shutdown(ctx)
 		id := component.NewID(ef.Type())
-		h.extensions[id] = ext
+		single = &observedSingle{singleStore: ext.(singleStore)}
+		h.extensions[id] = single
+		if batch, ok := ext.(multiStore); ok {
+			multi = &observedMulti{observedSingle: single, multi: batch}
+			h.extensions[id] = multi
+		}
 		cfg.TailStorageID = &id
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
@@ -172,6 +212,13 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		stats := map[string]any{"accepted": accepted.Load(), "decided": decided.Load(), "requests": requests.Load()}
+		if single != nil {
+			stats["single_take"] = single.calls.Load()
+		}
+		if multi != nil {
+			stats["take_many"] = multi.calls.Load()
+			stats["batched_ids"] = multi.ids.Load()
+		}
 		if sp != nil {
 			sp.mu.Lock()
 			stats["appends"] = sp.appends
