@@ -118,13 +118,14 @@ def run(mode,rate,duration,phase):
         events=counters(cg/"memory.events")
         complete=(sent["requests"]==n and z["accepted"]==n*128 and z["decided"]==n*32 and
                   found==wanted and not z.get("error") and z["probe_errors"]==0)
-        if mode=="raw":
+        if mode in ("raw","compact"):
             complete &= z["appends"]==n and z["written"]==sent["bytes"] and z["reads"]==sum(
                 ((32*i+99)//100)*100 <32*(i+1) for i in range(n))
         else:
             complete &= z["batched_ids"]==n*32 and z["single_take"]==0 and z["take_many"]>0
         result.update(complete=complete,pass_load=bool(complete and speed>=.95*rate and steady>=.95*rate
                       and decisions>=.95*rate and delay<=WAIT+5 and growth<=2 and not events["oom_kill"]),
+                      target_spans_s=rate*128, actual_spans_s=n*128/sent["seconds"], steady_spans_s=steady*128,
                       requests=n,accepted=z["accepted"],sent=z["sent"],digest=found[1],input_bytes=sent["bytes"],
                       MiB_s=sent["bytes"]/MIB/sent["seconds"],steady_rps=steady,decision_rps=decisions,
                       drain_s=delay,growth_s=growth,cpu=(z["cpu"]-first["cpu"])/(z["t"]-first["t"]),
@@ -137,7 +138,7 @@ def run(mode,rate,duration,phase):
                       dev_read_MiB=(z["dr"]-first["dr"])/MIB,
                       refault_pages=z["refault"]-first["refault"],memory_events=events,
                       probed=z["probed_calls"],probed_cold=z["probed_cold_calls"],probe_read_MiB=z["probed_read_bytes"]/MIB,
-                      logical_read_MiB=z.get("read",0)/MIB if mode=="raw" else None,
+                      logical_read_MiB=z.get("read",0)/MIB if mode in ("raw","compact") else None,
                       take_many=z.get("take_many"),batched_ids=z.get("batched_ids"))
     except (OSError,RuntimeError) as error:
         result["error"]=str(error)

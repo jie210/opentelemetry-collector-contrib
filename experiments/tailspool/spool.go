@@ -17,17 +17,20 @@ import (
 
 type traceID = pcommon.TraceID
 type segment struct {
+	number  int
 	file    *os.File
 	size    int64
 	records int
 }
 type record struct {
+	seq             uint64
 	seg             *segment
 	offset          int64
 	length, pending int
 	keep            map[traceID]bool
 }
 type spool struct {
+	journal                       *journal
 	mu                            sync.Mutex
 	dir                           string
 	limit                         int64
@@ -59,7 +62,7 @@ func projection(td ptrace.Traces) (ptrace.Traces, map[traceID]bool) {
 				p.SetSpanID(s.SpanID())
 				p.SetParentSpanID(s.ParentSpanID())
 				p.Status().SetCode(s.Status().Code())
-				ids[s.TraceID()] = true
+				ids[s.TraceID()] = ids[s.TraceID()] || s.Status().Code() == ptrace.StatusCodeError
 			}
 		}
 	}
@@ -88,7 +91,7 @@ func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 			return err
 		}
 		s.next++
-		s.current = &segment{file: f}
+		s.current = &segment{file: f, number: s.next - 1}
 		if old != nil && old.records == 0 {
 			if err = s.remove(old); err != nil {
 				s.err = err
@@ -107,9 +110,25 @@ func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 		s.err = err
 		return err
 	}
-	g.records++
+	if s.journal != nil {
+		if err = s.journal.appendRecord(s, r, ids); err != nil {
+			s.err = err
+			return err
+		}
+	}
 	s.written += int64(n)
 	s.appends++
+	if s.journal == nil {
+		s.register(r, ids)
+	}
+	if r.pending == 0 {
+		s.finish(r)
+	}
+	return s.err
+}
+
+func (s *spool) register(r *record, ids map[traceID]bool) {
+	r.seg.records++
 	for id := range ids {
 		if _, ok := s.yes.Get(id); ok {
 			r.markKeep(id)
@@ -121,10 +140,6 @@ func (s *spool) append(raw []byte, ids map[traceID]bool) error {
 		r.pending++
 		s.index[id] = append(s.index[id], r)
 	}
-	if r.pending == 0 {
-		s.finish(r)
-	}
-	return s.err
 }
 
 func (r *record) markKeep(id traceID) {
@@ -135,6 +150,11 @@ func (r *record) markKeep(id traceID) {
 }
 
 func (s *spool) remove(g *segment) error {
+	if s.journal != nil {
+		if err := s.journal.w.Flush(); err != nil {
+			return err
+		}
+	}
 	if err := g.file.Close(); err != nil {
 		return err
 	}
@@ -153,13 +173,20 @@ func (c observedCache) Put(id traceID, m cache.DecisionMetadata) {
 	s := c.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.journal != nil && !s.journal.replay && s.err == nil {
+		s.err = s.journal.decision(id, c.keep)
+	}
+	c.apply(id, m)
+}
+func (c observedCache) apply(id traceID, m cache.DecisionMetadata) {
+	s := c.store
 	c.Cache.Put(id, m)
 	for _, r := range s.index[id] {
 		if c.keep {
 			r.markKeep(id)
 		}
 		r.pending--
-		if r.pending == 0 {
+		if r.pending == 0 && (s.journal == nil || !s.journal.replay) {
 			s.finish(r)
 		}
 	}
@@ -199,6 +226,12 @@ func (s *spool) finish(r *record) {
 			return rs.ScopeSpans().Len() == 0
 		})
 		if err := s.sink(td); err != nil {
+			s.err = err
+			return
+		}
+	}
+	if s.journal != nil {
+		if err := s.journal.complete(r); err != nil {
 			s.err = err
 			return
 		}

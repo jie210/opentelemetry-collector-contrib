@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"sync"
@@ -155,6 +156,8 @@ func expected(n int) error {
 	return a.w.Flush()
 }
 
+var startRequest = flag.Int("start-request", 0, "first fixture request ID")
+
 func load(n, rate int) error {
 	ts, err := templates(payloads())
 	if err != nil {
@@ -183,7 +186,8 @@ func load(n, rate int) error {
 					return
 				}
 				time.Sleep(time.Until(start.Add(time.Duration(float64(req) / float64(rate) * float64(time.Second)))))
-				buf = ts[req%25].fill(buf, req)
+				id := req + *startRequest
+				buf = ts[id%25].fill(buf, id)
 				if err := conn.Invoke(ctx, "/opentelemetry.proto.collector.trace.v1.TraceService/Export", buf, &resp); err != nil {
 					once.Do(func() { first = err; cancel() })
 					return

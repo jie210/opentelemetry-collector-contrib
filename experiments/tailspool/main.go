@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,9 +14,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -117,7 +120,11 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "actual.sha256"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	flags := os.O_CREATE | os.O_WRONLY
+	if mode != "compact" {
+		flags |= os.O_EXCL
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "actual.sha256"), flags, 0600)
 	if err != nil {
 		return err
 	}
@@ -137,14 +144,30 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	no, _ := cache.NewLRUDecisionCache(150000)
 	h := host{componenttest.NewNopHost(), make(map[component.ID]component.Component)}
 	var sp *spool
+	var restored map[traceID]bool
 	var single *observedSingle
 	var multi *observedMulti
 	var decided, accepted, requests atomic.Int64
 	sink := func(_ context.Context, t ptrace.Traces) error { return a.consume(t) }
 	switch mode {
-	case "raw", "raw-sync":
+	case "raw", "raw-sync", "compact":
 		sp = newSpool(dir, a.consume, yes, no)
 		sp.syncSegments = mode == "raw-sync"
+		if mode == "compact" {
+			sp.limit = 16 << 20
+			sp.syncSegments = true
+			if err = featuregate.GlobalRegistry().Set("processor.tailsamplingprocessor.tailstorageextension", true); err != nil {
+				return err
+			}
+			id := component.MustNewID("compact")
+			h.extensions[id] = &errorStore{errors: map[traceID]bool{}}
+			cfg.TailStorageID = &id
+			restored, err = sp.recover(f, a)
+			if err != nil {
+				return err
+			}
+			defer sp.journal.f.Close()
+		}
 		yes = observedCache{yes, sp, true}
 		no = observedCache{no, sp, false}
 		sink = func(context.Context, ptrace.Traces) error { return nil }
@@ -187,6 +210,41 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 	if err = sampler.Start(ctx, h); err != nil {
 		return err
 	}
+	restoreCount := len(restored)
+	if restoreCount > 0 {
+		// Spread recovered IDs across decision buckets so a restart does not
+		// make an entire 30-second workload expire in a single tick.
+		start := time.Now()
+		n := 0
+		td := ptrace.NewTraces()
+		spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+		type item struct {
+			id      traceID
+			seq     uint64
+			isError bool
+		}
+		items := make([]item, 0, restoreCount)
+		for id, e := range restored {
+			items = append(items, item{id, sp.index[id][0].seq, e})
+		}
+		restored = nil
+		slices.SortFunc(items, func(a, b item) int { return cmp.Compare(a.seq, b.seq) })
+		for _, entry := range items {
+			statusSpan(spans, entry.id, entry.isError)
+			n++
+			if n%256 == 0 || n == restoreCount {
+				if err = sampler.ConsumeTraces(ctx, td); err != nil {
+					return err
+				}
+				td = ptrace.NewTraces()
+				spans = td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+				if restoreCount > 8192 {
+					time.Sleep(time.Until(start.Add(time.Duration(int64(*decisionWait) * int64(n) / int64(restoreCount)))))
+				}
+			}
+		}
+		restored = nil
+	}
 	g := grpc.NewServer(grpc.ForceServerCodec(wireCodec{}))
 	handler := endpoint(func(ctx context.Context, raw []byte) error {
 		td, err := (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces(raw)
@@ -218,8 +276,9 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		return err
 	}
 	mux := http.NewServeMux()
+	mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
-		stats := map[string]any{"accepted": accepted.Load(), "decided": decided.Load(), "requests": requests.Load()}
+		stats := map[string]any{"restored_ids": restoreCount, "accepted": accepted.Load(), "decided": decided.Load(), "requests": requests.Load()}
 		if *probeReads {
 			stats["probed_calls"] = readback.calls.Load()
 			stats["probed_cold_calls"] = readback.cold.Load()
@@ -278,6 +337,9 @@ func runAt(mode, dir, rpcAddr, statsAddr string) error {
 		} else {
 			stopErr = errors.Join(stopErr, sp.current.file.Close())
 		}
+	}
+	if sp != nil && sp.journal != nil {
+		stopErr = errors.Join(stopErr, sp.journal.w.Flush())
 	}
 	return errors.Join(err, stopErr, a.w.Flush())
 }

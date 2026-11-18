@@ -44,7 +44,7 @@ func loopback(t *testing.T) string {
 }
 
 func TestSplitTraceAndLateSpans(t *testing.T) {
-	for _, mode := range []string{"pebble", "raw"} {
+	for _, mode := range []string{"pebble", "raw", "compact"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			rpc, statsAddr := loopback(t), loopback(t)

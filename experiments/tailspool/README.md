@@ -44,3 +44,20 @@ The [v0.165.1 report](RESULTS-v165.md) compares the published modules with the s
 Run `build165.sh` and copy its `batched` binary as `tailcold` into a fresh directory on the ext4 test volume. Copy `benchmark.py` and `pressure.py` alongside it and run `python3 -u pressure.py` there as root. The driver expects Linux cgroup v2 with systemd I/O and memory accounting, the device vdb, and unused loopback ports 14317 and 18888.
 
 Both arms use a 30-second decision wait and a 512 MiB backend cgroup with swap disabled. The driver records cgroup device bytes, device-wide sectors, and sampled RSS. Probe mode measures calling-thread storage read bytes for every nonempty TakeMany and every 32nd raw ReadAt. This includes read-ahead issued by the calling thread. Compare these counters within each arm to establish that retrieval triggered physical reads. They measure different operations across arms. The raw arm uses buffered I/O with normal filesystem writeback.
+
+## Compact ERROR policy state and process restart
+
+The `compact` arm retains the official sampler and its decision caches. A tail storage extension combines the ERROR predicate across incoming batches of each trace. While a trace is pending, this store only retains the IDs for which it has seen ERROR. At decision time it constructs one minimal span per trace for the official evaluator. The original request stays in the sequential segments, and the export path reads the complete OTLP bytes. Other sampling policies require their own sufficient state.
+
+The metadata journal orders request registration, decisions, and local sink commits under the spool lock. Each registration records the segment number, byte range, trace IDs, error flags, and any decision inherited by a late batch. The raw write and the registration reach the kernel before the gRPC handler acknowledges the request. A local sink commit names both the input record and the durable-in-process-crash manifest boundary. Before unlinking a completed segment, the backend flushes its journal. Recovery ignores an incomplete trailing frame, verifies frame checksums, removes uncommitted manifest output, and rebuilds the pending index and decision caches before serving new traffic. It spreads pending IDs over a fresh decision window so they do not all expire on a single tick.
+
+This prototype targets backend process death on the same filesystem. It relies on the kernel surviving SIGKILL. The hash sink can roll back to a byte offset. An external Kafka exporter needs its own atomic or idempotent delivery protocol. The metadata journal currently grows with traffic and recovery scans it from the beginning. Raw segments are reclaimed as their records finish.
+
+To reproduce, use the `batched` build from `build165.sh` as `tailcold`, alongside `pressure.py`, `benchmark.py`, and `restart.py` in a fresh test directory on vdb. Run the following serially. Each request carries 128 spans. The target in both tests is 24,576 spans/s.
+
+```sh
+python3 -c 'import pressure; pressure.run("compact", 24576 // 128, 150, "sustain")'
+python3 restart.py
+```
+
+The restart driver sends two disjoint fixture ranges. It waits for gRPC ACKs from the first range, kills only the backend with SIGKILL while decisions are pending, and sends the second range after recovery. The expected manifest covers both ranges and preserves duplicate counts.
