@@ -226,3 +226,69 @@ v0.165.1 的 16 个 `processor_tail_sampling_*` 指标保留原名、属性和�
 **D 的折叠开销验收。** 按策略树计量每条待决 trace 的折叠状态字节数，与活跃 trace 数相乘核对 RSS。在接收路径分别测纯状态策略、多条正则属性策略和 OTTL 条件下的每 span CPU，确认折叠没有使接收成为瓶颈；存在型叶子命中后停止匹配的收益单独报告。构造大量候选同时到期、单条超长 trace、共享 record 和整 tick 的限速策略，记录截止到决定的分位数和最大值、ACK 吞吐及 cgroup 峰值，在 512 MiB 下逐档找出接入和求值都能持续排空的吞吐。
 
 上线前由业务确定可接受的 ACK 空窗、决策滞后、持久化故障范围和幂等责任。第一章的实测数字用于回归比较。
+
+## 三、实现状态与测试机实测
+
+分支 `feat/tailspool-fold` 基于 v0.165.1，在官方 tail_sampling 内实现 spool 模式，不再旁挂原型 sampler。
+
+### 已实现
+
+| 模块 | 内容 |
+|---|---|
+| 折叠（`internal/sampling`） | 读取 span 的叶子策略按片段折叠，latency 显式折叠；`TraceData.Folded` 保存折叠状态，bytes_limiting 用累计的 `TracesSize`。tick 用折叠状态构造候选，决定后释放。 |
+| spool（`internal/spool`） | 段文件 + WAL（`[len][crc32c][payload]`，帧 H/T/K/D/V/L/C/W/M）。T 帧按片段登记 `(traceID, ResourceSpans 序号)` 关联；K/D/V 携带水位，水位之后的记录用 L 帧逐关联结算。keep / drop 两侧决定备忘各自按缓存容量（为 0 时按 num_traces）保留，检查点超过阈值时重写。交付由 `max_inflight_records` 个 worker 在锁外回读、过滤、调用下一个 consumer，成功后写 C 并释放段。 |
+| processor spool 模式 | 配置 `tail_sampling.spool`。接收时登记 WAL 后按记录顺序送入主循环，主循环逐片段走官方缓存命中、容量移除和折叠。恢复在主循环内串行执行：恢复决定备忘，按原到达时间重放未结算片段，保持原截止时间。Shutdown 不对待决 trace 求值，留给下次启动恢复。 |
+| tailspool receiver | OTLP/gRPC 入口，codec 保留解压后的请求原文，经 context 传给 processor；客户端已超时的请求不登记。 |
+| 确定性 | `splitResourceSpansByTrace` 按首次出现顺序输出，tick 批次按 trace ID 排序，使官方与 spool 两种模式可逐 span 对比。 |
+
+### 与第二章设计的差异
+
+- 直连校验在运行时做：processor 要求 context 中的原文与本次 `ptrace.Traces` 为同一对象，否则拒绝请求，而不是在监听前报错。
+- 决策 hook 看到的 `ReceivedBatches` 为空；依赖它的扩展未接入。
+- 恢复串行，没有 inbox 和 BOOTTIME 处理，墙钟回拨未覆盖。
+- 启动时拒绝：recordPolicy / useTracestate gate、span-ingest、tail_storage、多 shard、任一缓存为 0 时的 block_on_overflow、含 `Now(` 的 OTTL 条件；运行时拒绝策略和大小上限的热更新。
+
+### 进程内差分
+
+`spool_e2e_test.go` 以同一输入分别运行官方内存路径和 spool 模式，逐 span 比较输出及重数，各 5 个随机种子：线上配置、容量移除、小缓存与字节上限、富策略（and / drop / not / OTTL / composite，含 first match）。不重启时全部完全一致；中途重启后，无容量压力的用例完全一致，容量压力下 LRU 访问顺序只能近似（即第二章的二级标准），测试只记录差异数。`internal/spool` 另测撕裂尾帧、段回收、提交后崩溃恢复，以及“记录处理中途被移除或因大小上限 drop”后重放与运行时状态一致。全部测试在 `-race` 下通过。
+
+### 测试机实测
+
+测试机 8 vCPU、15 GiB 内存，spool 目录在数据盘 `/data/tailspool-fold`。负载、collector 和计数 sink 同机运行。工具在 `experiments/tailspool/bench`：
+
+- `tsbench load` 生成确定性负载，每请求 128 span（8 代 trace 各 16 条、每条 1 span；单条 trace 共 8 span，相邻 span 间隔 200 个请求），每 span 512 B 属性。约 2% trace 末 span 为 ERROR，约 2.5% trace 有 150 ms span。失败按退避重试到成功。
+- `tsbench sink` 按 span 槽位计数；`tsbench report` 对比两次运行的每个 span 槽位。
+- 策略为线上配置：`decision_wait: 30s`、`num_traces: 200000`、ERROR / latency 100 ms / 10% 概率。
+
+官方路径在主循环里逐 trace 同步导出，关闭 exporter 队列时 200 req/s 就跟不上，客户端超时重试会污染基线，因此官方基线开启内存 `sending_queue`。spool 模式关闭队列，`ConsumeTraces` 返回即落到 sink，kill 验证的正是 spool 的交付边界。
+
+**无 kill 对比（各 60 秒负载）**
+
+| 负载 | 模式 | 达成 span/s | 峰值 RSS | CPU 秒 | spool 盘峰值 | 导出请求数 | 与官方逐 span 对比 |
+|---|---|---|---|---|---|---|---|
+| 200 req/s | 官方 | 24,108 | 1.86 GB | 32 | — | 26,602 | 基线，保留 203,302 span |
+| 200 req/s | spool | 24,108 | 0.38 GB | 33 | 555 MB | 11,979 | 缺失 0、多出 0、重复 0 |
+| 400 req/s | 官方 | 49,707 | 3.63–3.86 GB | 80 | — | 53,351 | 两次官方运行之间相差 3,424 span |
+| 400 req/s | spool | 49,701 | 0.60–0.63 GB | 73 | 1,048 MB | 23,979 | 与同轮官方完全一致 |
+| 800 req/s | 官方 | 100,905 | 4.00 GB | 117 | — | 27,605 | 基线，保留 211,502 span |
+| 800 req/s | spool | 100,907 | 0.61 GB | 115 | 1,064 MB | 12,479 | 缺失 0、多出 0、重复 0 |
+
+400 req/s 时活动 trace 恰在 num_traces 附近，移除哪些 trace 取决于到达与 tick 的相对时机，官方自身两次运行就差 3,424 span；第二轮官方与 spool 完全一致。800 req/s 时待决 trace 持续被容量移除，两种模式输出仍一致。spool 按记录导出，导出请求数约为官方逐 trace 导出的一半以下。
+
+**kill -9 后立即重启（客户端重试未 ACK 的请求）**
+
+| 负载 | kill | sink 延迟 | 缺失 | 多出 | 重复 span（记录） | 重启到可接收 | 恢复耗时（重放片段 / 待决 trace） |
+|---|---|---|---|---|---|---|---|
+| 200 req/s | 第 20、45 秒 | 0 | 0 | 0 | 0 | 0.12–0.55 s | 1.7 s（42 万 / 6.4 万）、3.1 s（67 万 / 14.4 万） |
+| 200 req/s | 每 8 秒共 7 次 | 0 | 0 | 0 | 0 | 0.12–0.66 s | 0.6–3.5 s，最多 74 万片段 |
+| 200 req/s | 每 8 秒共 7 次 | 50 ms | 0 | 0 | 844（48） | 同上 | 同上 |
+| 800 req/s | 第 20、45 秒 | 0 | 0 | 0 | 7（1） | 0.87–1.30 s | 7.1 s、6.7 s（151 万 / 20 万） |
+
+sink 延迟 50 ms 让交付几乎总在途，用来放大“已交给下游、C 未落盘”的窗口：7 次 kill 共重复 48 条记录，平均每次约 7 条，低于 `max_inflight_records`=16 的上限，每个重复 span 只多一份。被拒的客户端请求（连接拒绝）重试后没有产生重复。恢复期间 receiver 已在监听，新请求排在恢复之后处理。800 req/s 带容量压力的重启这次也逐 span 一致，但该场景只承诺二级近似。
+
+### 尚未覆盖
+
+- 阶段 A 的轮转失败、短写、WAL 失败注入；锁等待、WAL 与检查点耗时分解；`sync_on_rotate` 开关对照；ACK 尾延迟和决策滞后分位数。
+- 阶段 C 的定点 kill（登记、决定、回读、交给 exporter 后、写 C 前、回收时）目前只靠定时 kill 和慢 sink 随机命中；LB 超时重发只用客户端重试模拟；FD / inode 与降低 RLIMIT_NOFILE 的验收；512 MiB cgroup 限制。
+- 阶段 D 与 TakeMany Pebble 的等载对照、多 backend、慢盘、大属性 / 正则 / OTTL 的接收侧 CPU。
+- 被拒绝的 gate、span-ingest、多 shard 及决策 hook 的完整 `ReceivedBatches`。
