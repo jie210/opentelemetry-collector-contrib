@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"flag"
 	"log"
 	"net"
@@ -73,13 +74,16 @@ func spanTraces(tid pcommon.TraceID, s pcommon.SpanID, isErr bool) ptrace.Traces
 }
 
 func main() {
-	mode := flag.String("mode", "control", "control, transient or permanent")
+	mode := flag.String("mode", "control", "control, transient, permanent (B undecodable) or io (B's segment truncated)")
 	collector := flag.String("collector", "127.0.0.1:4317", "collector OTLP gRPC address")
 	listen := flag.String("sink", "127.0.0.1:5317", "sink OTLP gRPC address")
 	segments := flag.String("segments", "", "spool segments directory")
 	wait := flag.Duration("decision-wait", 5*time.Second, "decision_wait of the collector")
+	fillersAt := flag.Duration("fillers-at", 300*time.Millisecond, "time after A's first span when fillers are sent")
 	fillers := flag.Int("fillers", 200, "filler requests sent before B")
-	fillerSpans := flag.Int("filler-spans", 500, "traces per filler request")
+	fillerSpans := flag.Int("filler-spans", 500, "spans per filler request")
+	spansPerTrace := flag.Int("filler-spans-per-trace", 1, "filler spans sharing a trace")
+	senders := flag.Int("senders", 8, "concurrent filler senders")
 	flag.Parse()
 
 	s := &sink{spans: map[pcommon.SpanID]int{}}
@@ -117,11 +121,12 @@ func main() {
 	t0 := time.Now()
 	send(spanTraces(traceA, a1, false))
 	log.Printf("A normal span acknowledged")
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(time.Until(t0.Add(*fillersAt)))
 
+	fillerBase := id16(0xF0, 0)
 	var next atomic.Int64
 	var wg sync.WaitGroup
-	for range 8 {
+	for range *senders {
 		wg.Go(func() {
 			for {
 				i := int(next.Add(1)) - 1
@@ -133,7 +138,9 @@ func main() {
 				for j := range *fillerSpans {
 					sp := spans.AppendEmpty()
 					n := uint32(i**fillerSpans + j)
-					sp.SetTraceID(id16(0xF0, n))
+					tid := fillerBase
+					binary.BigEndian.PutUint32(tid[12:], n/uint32(*spansPerTrace))
+					sp.SetTraceID(tid)
 					sp.SetSpanID(sid(0xF0, n))
 					sp.SetName("filler")
 				}
@@ -165,6 +172,18 @@ func main() {
 		if offset < 0 {
 			log.Fatal("B not found in segments")
 		}
+		if *mode == "io" {
+			if offset != 0 {
+				log.Fatal("B does not have a segment of its own; set segment_size to 1")
+			}
+			if err := os.Truncate(segFile, 0); err != nil {
+				log.Fatal(err)
+			}
+			log.Printf("B's segment %s truncated, %s after its acknowledgement",
+				filepath.Base(segFile), time.Since(tB).Round(time.Microsecond))
+		}
+	}
+	if *mode == "transient" || *mode == "permanent" {
 		f, err := os.OpenFile(segFile, os.O_WRONLY, 0)
 		if err != nil {
 			log.Fatal(err)

@@ -4,6 +4,7 @@
 package tailsamplingprocessor
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -204,6 +205,131 @@ func TestSpoolDropsUndecodableRecord(t *testing.T) {
 			require.Zero(t, spans[pcommon.SpanID{2}])
 		})
 	}
+}
+
+func errorPolicy() []PolicyCfg {
+	return []PolicyCfg{{sharedPolicyCfg: sharedPolicyCfg{Name: "errors", Type: StatusCode, StatusCodeCfg: StatusCodeCfg{StatusCodes: []string{"ERROR"}}}}}
+}
+
+func marshalTraces(t *testing.T, td ptrace.Traces) []byte {
+	var m ptrace.ProtoMarshaler
+	data, err := m.MarshalTraces(td)
+	require.NoError(t, err)
+	return data
+}
+
+// truncateSegmentOf empties the segment holding only the request want and
+// returns its path.
+func truncateSegmentOf(t *testing.T, dir string, want []byte) string {
+	segments, err := filepath.Glob(filepath.Join(dir, "segments", "*.otlp"))
+	require.NoError(t, err)
+	for _, seg := range segments {
+		data, err := os.ReadFile(seg)
+		require.NoError(t, err)
+		if bytes.Equal(data, want) {
+			require.NoError(t, os.Truncate(seg, 0))
+			return seg
+		}
+	}
+	require.FailNow(t, "no segment holds only the request")
+	return ""
+}
+
+// A tick waits for the requests registered before it, so the error span of
+// trace 1, acknowledged within its decision window, counts however long
+// the requests ahead of it take. Trace 1's deadline passes many times over
+// meanwhile.
+func TestSpoolTickWaitsForRegisteredRequests(t *testing.T) {
+	cases := []struct {
+		name string
+		// fillers are requests of unrelated traces between the spans.
+		fillers int
+		// fault empties the segment of request b, the only filler;
+		// recover restores it once its read failed.
+		fault, recover bool
+	}{
+		{name: "read retried then released", fillers: 1, fault: true},
+		{name: "read retried then recovered", fillers: 1, fault: true, recover: true},
+		{name: "backlog read back", fillers: 20000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := newSpanCounter()
+			dir := t.TempDir()
+			p, c := newAlwaysSampleSpool(t, sink, func(cfg *Config) {
+				cfg.Options = append(cfg.Options, withTickerFrequency(2*time.Millisecond))
+				cfg.DecisionWait = time.Second
+				cfg.NumTraces = 100000
+				cfg.PolicyCfgs = errorPolicy()
+				cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1}
+				if tc.fault {
+					cfg.Spool.SegmentSize = 1
+				}
+			})
+			defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
+			sp := spoolOf(p)
+
+			fillers := make([]ptrace.Traces, tc.fillers)
+			for i := range fillers {
+				fillers[i] = ptrace.NewTraces()
+				span := fillers[i].ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+				span.SetTraceID(pcommon.TraceID{2, byte(i >> 16), byte(i >> 8), byte(i)})
+				span.SetSpanID(pcommon.SpanID{2, byte(i >> 16), byte(i >> 8), byte(i)})
+			}
+			bData := marshalTraces(t, fillers[0])
+
+			unblock := blockLoop(c)
+			require.NoError(t, p.ConsumeTraces(context.Background(), spanOf(1, 1, false)))
+			for _, td := range fillers {
+				require.NoError(t, p.ConsumeTraces(context.Background(), td))
+			}
+			require.NoError(t, p.ConsumeTraces(context.Background(), spanOf(1, 3, true)))
+			var seg string
+			if tc.fault {
+				seg = truncateSegmentOf(t, dir, bData)
+			}
+			unblock()
+			if tc.recover {
+				require.Eventually(t, func() bool { return sp.Stats().ReadFailures >= 1 }, 5*time.Second, time.Millisecond)
+				require.NoError(t, os.WriteFile(seg, bData, 0o640))
+			}
+
+			require.Eventually(t, func() bool {
+				st := sp.Stats()
+				return st.UnprocessedRecords == 0 && st.PendingTraces == 0 && st.LiveRecords == 0
+			}, 10*time.Second, time.Millisecond)
+			spans, _ := sink.snapshot()
+			require.Equal(t, map[pcommon.SpanID]int{{1}: 1, {3}: 1}, spans)
+			if tc.fault && !tc.recover {
+				require.EqualValues(t, 1, sp.Stats().ReleasedUnreadable)
+			} else {
+				require.Zero(t, sp.Stats().ReleasedUnreadable)
+			}
+		})
+	}
+}
+
+// Waiting for space runs ticks while later requests are queued; they are
+// not postponed, or the loop would wait for itself.
+func TestSpoolTickWhileWaitingForSpace(t *testing.T) {
+	sink := newSpanCounter()
+	p, c := newAlwaysSampleSpool(t, sink, func(cfg *Config) {
+		cfg.Options = append(cfg.Options, withTickerFrequency(20*time.Millisecond))
+		cfg.NumTraces = 1
+		cfg.BlockOnOverflow = true
+		cfg.DecisionCache = DecisionCacheConfig{SampledCacheSize: 10, NonSampledCacheSize: 10}
+	})
+	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
+
+	unblock := blockLoop(c)
+	for i := range 3 {
+		require.NoError(t, p.ConsumeTraces(context.Background(), singleSpan(byte(i+1))))
+	}
+	unblock()
+	require.Eventually(t, func() bool {
+		spans, _ := sink.snapshot()
+		return len(spans) == 3
+	}, 10*time.Second, time.Millisecond)
 }
 
 func TestSpoolBackpressure(t *testing.T) {

@@ -184,6 +184,31 @@ func TestUnprocessedQueue(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
+func TestWaitingSince(t *testing.T) {
+	s, _, err := Open(testConfig(t.TempDir()), zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Stop()) }()
+	r := rand.New(rand.NewPCG(4, 4))
+	var next uint64
+	req := newTestRequest(t, r, &next, pcommon.TraceID{1})
+	t0 := time.Unix(1700000000, 0)
+
+	require.False(t, s.WaitingSince(t0))
+	first, err := s.Register(context.Background(), req.raw, req.assocs, t0, nil)
+	require.NoError(t, err)
+	// Taken by the lock after the first, so it arrived no earlier.
+	second, err := s.Register(context.Background(), req.raw, req.assocs, t0.Add(-time.Millisecond), nil)
+	require.NoError(t, err)
+	require.Equal(t, t0, second.Arrival())
+
+	require.False(t, s.WaitingSince(t0.Add(-time.Nanosecond)))
+	require.True(t, s.WaitingSince(t0))
+	s.Begin(first)
+	require.True(t, s.WaitingSince(t0))
+	s.Begin(second)
+	require.False(t, s.WaitingSince(t0.Add(time.Hour)))
+}
+
 func TestCheckpointKeepsFramesWrittenMeanwhile(t *testing.T) {
 	for seed := range uint64(10) {
 		r := rand.New(rand.NewPCG(seed, 11))

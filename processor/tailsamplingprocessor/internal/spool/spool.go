@@ -143,8 +143,10 @@ type Spool struct {
 	err     error
 
 	// unprocessed holds registered records in sequence order until the
-	// processor begins them; wake signals that it is not empty.
+	// processor begins them; wake signals that it is not empty. lastArrival
+	// keeps their arrivals in sequence order too.
 	unprocessed       []*Record
+	lastArrival       int64
 	unprocessedBytes  int64
 	unprocessedMemory int64
 	wake              chan struct{}
@@ -248,8 +250,9 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 	if err != nil {
 		return nil, s.fail(fmt.Errorf("append to segment %d: %w", seg.id, err))
 	}
+	s.lastArrival = max(s.lastArrival, arrival.UnixNano())
 	r := &Record{
-		seq: s.nextSeq, seg: seg, off: off, length: uint32(len(raw)), arrival: arrival.UnixNano(),
+		seq: s.nextSeq, seg: seg, off: off, length: uint32(len(raw)), arrival: s.lastArrival,
 		assocs: assocs, state: make([]assocState, len(assocs)), open: len(assocs),
 	}
 	s.nextSeq++
@@ -355,6 +358,14 @@ func (s *Spool) Next() (*Record, any, bool) {
 	}
 	r := s.unprocessed[0]
 	return r, r.payload, true
+}
+
+// WaitingSince reports whether a record that arrived at or before t waits
+// for Begin.
+func (s *Spool) WaitingSince(t time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.unprocessed) > 0 && s.unprocessed[0].arrival <= t.UnixNano()
 }
 
 // ReadUnprocessed decodes a queued record whose payload was not kept. A

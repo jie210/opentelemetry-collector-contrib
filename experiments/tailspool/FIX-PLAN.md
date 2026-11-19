@@ -223,7 +223,7 @@ spool 的问题不在于坏数据丢了，而在于对确定性失败无限重�
 
 1. **解码错误立即释放。** 解码失败是确定性的。待处理队首、交付、重启后重放三处读到解码错误时，都立即调用 `releaseUnreadableLocked`：关联全部按 drop 结算并提交，记 Error 日志和 `ReleasedUnreadable`，然后继续处理。待处理队首释放时照常推进水位，WAL 语义不变。
 2. **待处理队首的 I/O 错误短暂重试后释放。** 队首挡着后续全部记录，退避重试数次（共约 1–2 s）仍失败则同样释放。交付环节的 I/O 错误保持现状：本次运行内重试，重启后有限次重试再释放，一条记录卡住不影响其他记录。
-3. **tick 推迟决定：待验证后再定。** 有了 1、2，复现场景中的队首阻塞不再发生。剩下的推论是：积压或重启恢复时 tick 不等待队列，有效决策窗口会缩短约等于积压延迟。先在测试机实测，确认存在再按 trace 推迟决定（登记时按关联计数，tick 时跳过仍有截止前片段在排队的 trace，容量满时的嵌套 tick 不推迟）。
+3. **tick 等待已登记的请求：已实施。** 解码失败立即释放后，原复现场景通过。I/O 有限重试和无故障的回读积压都会让到期 tick 先于窗口内已登记的片段求值，两者都已实测复现。现在定时 tick 到来时，如果待处理队首在 tick 之前到达，就推迟到这些请求处理完再求值。实现与复测见下文。
 4. **写盘前检查嵌套深度：可选，暂不做。** 原版同样接受这类请求，丢弃后已不会阻塞，此项只能让丢失对客户端可见。
 
 ### 修复验收
@@ -232,11 +232,11 @@ spool 的问题不在于坏数据丢了，而在于对确定性失败无限重�
 - A/B/A 顺序，B 为解码失败：B 立即释放，A 的两条 span 各导出一次。
 - 队首持续 I/O 错误：重试数次后释放，后续无关记录恢复正常采样；验证同机 SIGKILL 前后 WAL 水位不会跳过未结算的关联。
 - 交付时解码失败立即释放并提交；I/O 错误仍按原逻辑重试。
-- 积压与重启恢复下决策窗口是否缩短（第 3 项的前置验证）。
+- 验证 I/O 重试跨过 tick 时的决策一致性，并补测正常积压和重启恢复，验收条件见下文。
 
 ### 实施与复测
 
-已实施方案第 1、2 项，第 3、4 项未做。
+已实施方案第 1、2 项，第 3 项见下文“tick 等待已登记的请求”，第 4 项未做。
 
 - `readRecord` 把解码失败包装为 `errUndecodable`。`readFailedLocked`（交付）和 `ReadRecovered`（重放）遇到它立即释放，不标记整段不可读。
 - `ReadUnprocessed` 改为返回 `(td, released, err)`：解码失败，或累计 5 次读失败（处理器退避 0.1、0.2、0.4、0.8 s，共约 1.5 s），即把记录移出待处理队列、按 drop 结算并提交、推进水位；处理器随即处理下一条。
@@ -253,3 +253,68 @@ spool 的问题不在于坏数据丢了，而在于对确定性失败无限重�
 | 40 层嵌套 JSON，默认内存预算 | 20/20，坏记录交付时反复重试，重启后才释放 | 20/20，交付时释放 1 次，重启后无残留 |
 
 日志在测试机 `/mnt/otelbench/tailspool-fold/probe/{otlp,poison}`（修复前）和 `{otlp-fix,poison-fix}`（修复后）。
+
+### 已确认的剩余问题：队首 I/O 重试跨过决策 tick
+
+在测试机 `10.98.1.5` 上复测提交 `64da25450b4`。真实 OTLP/gRPC 的解码失败对照已通过，A 的普通 span 和 ERROR span 都各导出一次。另用 processor 探针注入段文件读取错误 `EIO`，验证 I/O 有限重试期间的决策行为。
+
+**复现步骤**
+
+1. 使用默认一秒 ticker，配置 `decision_wait: 3s`、`num_traces: 10`，只启用 `status_code: ERROR`。将 `max_unprocessed_memory` 和 `segment_size` 都设为 1 字节，让待处理请求走磁盘回读，并使三个非空请求位于各自的段文件。
+2. 在 t=0 发送 Trace A 的普通 span，等它被读入待决状态。此时 A 尚未发布决定。
+3. 约 t=2.8 s 时，先发送无关的 Trace B，再发送同一 Trace A 的 ERROR span。只对 B 所在段的读取注入连续 `EIO`。A 的 ERROR 数据保持完好，并在 3 秒窗口内从 `ConsumeTraces` 成功返回。探针直接调用 processor，使用真实时钟。
+4. 让默认 tick 和队首重试继续运行，分别记录 A 发布决定、B 被释放、队列排空和 sink 收到的 span 数。
+
+**实测结果（3 次结果一致）**
+
+| 事件 | 相对 t=0 的时间或结果 |
+|---|---|
+| A 的 ERROR span 成功登记 | 2.801–2.802 s，早于 3 s 窗口 |
+| A 发布 drop | 4.002–4.003 s，此时 B 仍在重试，A 的 ERROR span 仍在队列里 |
+| B 第 5 次读取失败后释放，随后队列排空 | 4.305–4.306 s |
+| A 最终导出 | 普通 span 0，ERROR span 0 |
+
+I/O 错误触发约 1.5 秒的累计退避。有限重试保证队列最终推进，到期 tick 仍能在此期间凭 A 已折叠的普通 span 发布 drop。ERROR span 随后被处理时继承这个决定。相关代码：[队首回读、重试计数与释放](../../processor/tailsamplingprocessor/internal/spool/spool.go#L360) · [到期 tick](../../processor/tailsamplingprocessor/processor.go#L624)。
+
+测试机证据目录为 `/data/tailspool-0863799-verify/run-64da2545`。日志为 `out/io-boundary.log`，隔离副本中的探针为 `src/processor/tailsamplingprocessor/verification_io_boundary_test.go`，注入钩子为同一模块下的 `internal/spool/verification_io_hook.go`。在该模块下运行 `go test -mod=readonly -race -tags verify_spool_io_boundary -count=3 -run '^TestVerificationDecisionDuringBoundedHeadIOFailure$' -v .` 可复现实测。现有探针断言的是缺陷行为，修复时需将断言改为以下预期。
+
+**修复验收**
+
+- 保持上述 A/B/A 时序，确认 ERROR 在窗口内成功登记，且首个到期 tick 发生时 B 仍在重试。A 应保持待决。B 在第 5 次失败后释放一次，A 的 ERROR 纳入求值后只发布一次 keep，A 的两条 span 各导出一次。
+- 用同一时序让 B 在用尽重试前恢复，验证 B 可继续处理，A 仍只发布一次 keep、两条 span 各导出一次。加入一条在 tick 前已处理完所有窗口内片段的无关 trace，验证其决定不因 B 推迟。
+- 补测无 I/O 故障的积压和重启后继续接流，分别验证窗口内已登记的片段纳入本轮求值，以及在决定发布后到达的片段沿用既有决定。覆盖 `block_on_overflow` 达到容量上限的情况，并在 B 释放前后分别注入同机 SIGKILL，核对 WAL 重放不跳过未结算的关联。
+
+### tick 等待已登记的请求：实施与复测
+
+**根因**：spool 写盘即 ACK，主循环随后才逐条处理，而定时 tick 是同一个 `select` 里的独立分支，只看已处理的折叠状态。原版在数据送入 `workChan` 后才返回，ACK 与决策之间的滞后有上限；spool 解耦后这个上限消失。队首 I/O 重试和普通积压都会让到期 tick 先于窗口内已 ACK 的片段求值，后续片段继承 drop。
+
+**实现**
+
+- `Spool.WaitingSince(t)`：待处理队首是否在 `t` 或之前到达。`Register` 在锁内把到达时间取为不早于上一条，保证队列按到达时间有序，只看队首即可。
+- 顶层循环收到定时 tick 时，如果 `WaitingSince(tick 时间)` 为真，就记下这次 tick 并返回；已有推迟的 tick 时，新 tick 直接丢弃，与繁忙循环中 ticker 丢 tick 的行为一致。每处理或释放一条记录后检查一次，队首越过该时间或队列为空时执行 `samplingPolicyOnTick`。
+- `waitForSpace` 中嵌套的 tick 不推迟，否则主循环会等自己。测试用的手动 tick 保持立即执行，许多测试依赖它卡住主循环。
+- 代价：持续过载时决策整体随积压延后，内存中的待决 trace 随之增多，可能更早触发 `num_traces` 容量淘汰。积压上限仍由 `max_unprocessed_*` 背压控制。按 trace 推迟（只推迟有片段在排队的 trace）未采用；上面验收中“无关 trace 不因 B 推迟”一条不满足，全局等待会一并推迟其他 trace。
+
+**单测**（真实 ticker，2 ms 一次，`decision_wait: 1s`，只采 ERROR）
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| A/B/A，B 所在段截断，5 次读失败后释放 | A 普通 0、ERROR 0 | 10/10：A 普通 1、ERROR 1，B 释放 1 次 |
+| 同上，B 在第 1 次读失败后恢复 | A 普通 0、ERROR 0 | 10/10：A 普通 1、ERROR 1，无释放 |
+| A、20000 条无关请求（回读）、A 的 ERROR | 10/10 漏采 | 10/10：A 普通 1、ERROR 1 |
+| `block_on_overflow`、`num_traces: 1`，3 条请求排队 | — | 10/10 全部导出，嵌套 tick 不死锁 |
+
+processor 模块全量测试与 `-race` 通过。
+
+**测试机 OTLP 复测**（`decision_wait: 3s`，headprobe，每组 3 次；otelcol-fix 为 `64da25450b4`，otelcol-tick 为本修复）
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| io：B 所在段截断（`segment_size: 1`、`max_unprocessed_memory: 1`），A 的 ERROR 在 +2.56 s ACK | 3/3 A 普通 0、ERROR 0 | 3/3 A 普通 1、ERROR 1；读失败 4、释放 1 |
+| io 对照：不截断 | A 1/1 | A 1/1 |
+| 回读积压：`max_unprocessed_memory: 1`，3000 个请求 × 500 span，A 的 ERROR 在 +1.7 s ACK | 3/3 A 1/1 | 3/3 A 1/1 |
+| 回读积压：6000 个请求 × 500 span，A 的 ERROR 在 +2.3 s ACK | 3/3 A 普通 0、ERROR 0 | 3/3 A 普通 1、ERROR 1；其中 2 次在 +6 s 尚未导出，+11 s 时已导出 |
+
+无 I/O 故障、只靠回读积压就能稳定复现漏采，修复后全部纠正；代价是决策随积压延后，与预期一致。日志在测试机 `/mnt/otelbench/tailspool-fold/probe/tickfix/`。默认内存预算下的积压（`backlog/`，最多 3000 × 500 span）修复前也未复现，处理速度跟得上接收。
+
+尚未覆盖：重启后继续接流、`block_on_overflow` 达到容量上限时的 OTLP 实测，以及 B 释放前后的 SIGKILL。
