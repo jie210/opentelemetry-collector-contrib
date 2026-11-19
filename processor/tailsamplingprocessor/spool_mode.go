@@ -90,7 +90,7 @@ func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptr
 	var assocs []spool.Assoc
 	var batches []traceBatch
 	for ri, rss := range td.ResourceSpans().All() {
-		for _, b := range splitResourceSpansByTrace(rss) {
+		for _, b := range splitResourceSpansByTrace(rss, true) {
 			b.idx = len(assocs)
 			assocs = append(assocs, spool.Assoc{ID: b.id, Resource: uint32(ri)})
 			batches = append(batches, b)
@@ -115,7 +115,7 @@ func (tsp *tailSamplingSpanProcessor) processNextSpooled(tickChan <-chan time.Ti
 func spooledFragments(td ptrace.Traces, open map[spool.Assoc]int) []traceBatch {
 	var batch []traceBatch
 	for ri, rss := range td.ResourceSpans().All() {
-		for _, b := range splitResourceSpansByTrace(rss) {
+		for _, b := range splitResourceSpansByTrace(rss, true) {
 			idx, ok := open[spool.Assoc{ID: b.id, Resource: uint32(ri)}]
 			if !ok {
 				continue

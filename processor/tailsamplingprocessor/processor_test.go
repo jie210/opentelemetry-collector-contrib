@@ -301,7 +301,7 @@ func TestSplitResourceSpansByTrace(t *testing.T) {
 	span.SetSpanID(uInt64ToSpanID(3))
 	span.SetParentSpanID(uInt64ToSpanID(1))
 
-	batches := splitResourceSpansByTrace(rss)
+	batches := splitResourceSpansByTrace(rss, false)
 	require.Len(t, batches, 2)
 	byID := make(map[pcommon.TraceID]traceBatch, len(batches))
 	for _, batch := range batches {

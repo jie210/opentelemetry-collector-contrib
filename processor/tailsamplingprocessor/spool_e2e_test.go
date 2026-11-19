@@ -356,6 +356,10 @@ func runSpoolDiff(t *testing.T, cfg Config, seed uint64, restart, exact bool) {
 	}
 	spoolCfg.Spool.Directory, spoolCfg.Spool.SegmentSize, spoolCfg.Spool.CheckpointSize = t.TempDir(), 16<<10, 32<<10
 	cfg.Spool = nil
+	// The in-memory processor splits requests and decides traces in map
+	// order; the spool's fixed order is one of those, which makes the outputs
+	// comparable span by span.
+	cfg.Options = append(cfg.Options, func(tsp *tailSamplingSpanProcessor) { tsp.fixedOrder = true })
 
 	wantSink := newSpanCounter()
 	official, oc := newDiffProcessor(t, cfg, wantSink)

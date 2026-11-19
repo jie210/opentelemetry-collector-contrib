@@ -197,7 +197,7 @@ func (sp *shardedProcessor) ConsumeTraces(ctx context.Context, td ptrace.Traces)
 	// make a retry resend empty spans.
 	for _, rss := range td.ResourceSpans().All() {
 		totalResourceSpans++
-		for _, batch := range splitResourceSpansByTrace(rss) {
+		for _, batch := range splitResourceSpansByTrace(rss, sp.shards[0].fixedOrder) {
 			shardIdx := sp.traceIDToShard(batch.id)
 			shardBatches[shardIdx] = append(shardBatches[shardIdx], batch)
 			totalSpans += batch.spanCount

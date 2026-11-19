@@ -118,6 +118,9 @@ type tailSamplingSpanProcessor struct {
 	spool     *spool.Spool
 	foldPlan  *sampling.FoldPlan
 	recovered *spool.Recovered
+	// fixedOrder splits requests and decides traces in a fixed order, so the
+	// decision caches evolve the same way when a spool replays requests.
+	fixedOrder bool
 }
 
 func newTracesProcessor(ctx context.Context, set processor.Settings, nextConsumer consumer.Traces, cfg Config) (processor.Traces, error) {
@@ -171,6 +174,7 @@ func newShardProcessor(ctx context.Context, set processor.Settings, nextConsumer
 		// queue up new policies without blocking on the ticker.
 		newPolicyChan:    make(chan newPolicyCmd, 1),
 		newTraceSizeChan: make(chan uint64, 1),
+		fixedOrder:       cfg.Spool != nil,
 	}
 
 	for _, opt := range cfg.Options {
@@ -766,13 +770,13 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 	// instead: finalize any still-pending trace as implicit not sampled
 	// without policy evaluation, so no candidate is collected for it.
 	candidates := make([]tickCandidate, 0, batchLen)
-	// Decide in a fixed order so that the decision caches evolve the same way
-	// on every run, including a spool replay.
 	ids := make([]pcommon.TraceID, 0, batchLen)
 	for id := range batch {
 		ids = append(ids, id)
 	}
-	slices.SortFunc(ids, func(a, b pcommon.TraceID) int { return bytes.Compare(a[:], b[:]) })
+	if tsp.fixedOrder {
+		slices.SortFunc(ids, func(a, b pcommon.TraceID) int { return bytes.Compare(a[:], b[:]) })
+	}
 	for _, id := range ids {
 		trace, ok := tsp.idToTrace[id]
 		if !ok {
@@ -1092,8 +1096,9 @@ func (tsp *tailSamplingSpanProcessor) makeDecisionOnSpanIngest(id pcommon.TraceI
 // scopes, and their schema URLs are copied, since several traces may share them.
 //
 // We walk scopes in order and never go back, so lastScope is enough to open
-// dest scopes in first-seen order.
-func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
+// dest scopes in first-seen order. Traces come in first-seen order if
+// ordered is set, and in map order otherwise.
+func splitResourceSpansByTrace(rss ptrace.ResourceSpans, ordered bool) []traceBatch {
 	srcScopes := rss.ScopeSpans()
 	type builder struct {
 		rs        ptrace.ResourceSpans
@@ -1103,8 +1108,6 @@ func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 		hasRoot   bool
 	}
 	builders := make(map[pcommon.TraceID]*builder)
-	// Traces are emitted in first-seen order so that the decision caches see
-	// the same access order on every run, including a spool replay.
 	var order []pcommon.TraceID
 
 	for j := 0; j < srcScopes.Len(); j++ {
@@ -1120,7 +1123,9 @@ func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 				rs.SetSchemaUrl(rss.SchemaUrl())
 				b = &builder{rs: rs, lastScope: -1}
 				builders[id] = b
-				order = append(order, id)
+				if ordered {
+					order = append(order, id)
+				}
 			}
 			if b.lastScope != j {
 				dest := b.rs.ScopeSpans().AppendEmpty()
@@ -1139,6 +1144,17 @@ func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 	}
 
 	batches := make([]traceBatch, 0, len(builders))
+	if !ordered {
+		for id, b := range builders {
+			batches = append(batches, traceBatch{
+				id:        id,
+				hasRoot:   b.hasRoot,
+				rss:       b.rs,
+				spanCount: b.count,
+			})
+		}
+		return batches
+	}
 	for _, id := range order {
 		b := builders[id]
 		batches = append(batches, traceBatch{
