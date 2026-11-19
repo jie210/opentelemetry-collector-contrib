@@ -1,43 +1,45 @@
-# 修复计划：直连校验、登记 deadline 与恢复期接流、读盘失败
+# 修复计划：存储内容、登记 deadline 与恢复期接流、读盘失败
 
 针对 `feat/tailspool-fold` 评审中发现的三个问题。三者都已由探针复现：
 
 | 问题 | 复现 | 后果 |
 |---|---|---|
-| 直连校验只在运行时比较对象 | 在同一 pdata 对象上原地改属性，processor 接受请求，sink 收到修改前的值 | 策略按修改后的数据求值，交付的却是原文，两者不一致 |
+| 存的是 receiver 收到的原文，求值用的是 tail_sampling 收到的数据 | 在同一 pdata 对象上原地改属性，processor 接受请求，sink 收到修改前的值 | 策略按修改后的数据求值，交付的却是原文，两者不一致 |
 | deadline 在等锁前检查 | 请求在等登记锁时过期，WAL 仍登记成功；端口监听后 ACK 仍会停顿 | 客户端已超时的请求被登记，重试产生重复；恢复期间 ACK 停顿 |
 | 读盘失败被当作交付完成 | 注入段文件读失败后 committed=1、`delivered_spans=0`，重启后无待重放记录 | 已登记、应保留的数据永久丢失 |
 
-## 1. 启动前校验直连
+## 1. 改为存 tail_sampling 看到的数据
 
 ### 根因
 
-`consumeSpooled` 只比较 context 中的 `rawrequest.Request.Traces` 与入参是否为同一对象（`spool_mode.go` 第 72–76 行）。原地修改的 processor（attributes、transform、resource 等）不换对象，校验通过；求值看到修改后的数据，交付回读的却是登记的原文。换对象或异步转发的 processor（batch、groupbytrace）要到第一条请求才暴露，做不到监听前报错。
+spool 写盘的是 tailspool receiver 收到的原始请求字节，求值用的却是 tail_sampling 收到的 `td`，关联按“(trace ID, ResourceSpans 下标)”在两者之间对位。只要两者不同，结果就错：
 
-### 为什么不用 `MutatesData`
+- 原地修改（attributes、transform、resource）：求值看到修改后的值，交付回读的是原值，修改在输出中消失（探针复现的就是这种）。
+- 删除 span（filter）：原文里仍有这些 span，交付时按 trace 过滤会把它们带回来。
+- 删除整个 Resource：下标错位，交付错误的 span、漏掉应保留的。
 
-receiver 的 next 是 pipeline 的 capabilities 节点，其 `MutatesData` 是所有 processor 与 exporter 的或（collector `service/internal/graph/graph.go` 第 346–353 行），没有位置信息。按它判断会误杀放在 tail_sampling 之后的改数据 processor，而这些 processor 无害：spool 每次交付都从段文件重新解码一份新对象，交付成功后不再持有；下游修改后返回失败，重试也会重新回读（`deliver.go` 第 128–133 行）。所以规则只约束 tail_sampling **之前**。
+`consumeSpooled` 只比较两者是否为同一对象（`spool_mode.go` 第 72–76 行），挡不住原地修改。之前考虑的“启动前校验 tail_sampling 必须是第一个 processor”只能靠新增 extension 读取配置实现，并且仍需专用 receiver。
 
 ### 方案
 
-v0.165 中，实现 `extensioncapabilities.ConfigSnapshotWatcher` 的 extension 会在 `Pipelines.StartAll` **之前**收到生效配置（collector `service/service.go` 第 242–249 行），可以按位置精确校验。
+存、取都在 tail_sampling 内完成：登记时把收到的 `td` 序列化后写段，交付时回读的就是求值所用的同一份数据。
 
-1. 新增 extension `tailspool_guard`（放在 `receiver/tailspoolreceiver` 模块内，避免新增模块）。`NotifyConfigSnapshot` 读取 `Effective()` 中的 `service.pipelines` 和 `processors`，对 traces pipeline 校验：
-   - 每个配置了 `spool` 的 tail_sampling 实例：只出现在一条 pipeline；该 pipeline 的 `processors[0]` 就是它；该 pipeline 的 receiver 全部为 `tailspool`（排除 connector 和其他 receiver）。
-   - 每个 `tailspool` receiver：只出现在一条 pipeline（多 pipeline 时 fanout 可能克隆数据给 tail_sampling）；该 pipeline 的第一个 processor 是配置了 spool 的 tail_sampling。
-   - tail_sampling 之后的 processor 和 exporter 不受限制。
-   - 校验结果按组件 ID 保存；校验失败直接返回错误，Collector 在启动 pipeline 前退出。
-2. spool 模式的 tail_sampling 在 `Start` 中通过 `host.GetExtensions()` 找到 guard 并查询自身 ID 的校验结果；找不到 guard 或结果不是“通过”就返回错误。tailspool receiver 在 `Start` 中、`Listen` 之前做同样的查询。pipeline 按逆拓扑序启动，processor 先于 receiver，因此两边都在监听前失败。
-3. 运行时保留对象一致性检查作为兜底；若收到没有原文的请求，除了拒绝本请求，还通过 `componentstatus` 上报致命错误，让 Collector 退出，而不是持续拒流。
-4. spool 目录加 `flock` 独占锁，防止两个实例（或两个进程）共用同一目录。
+1. `consumeSpooled` 在拆分关联之后、登记之前，用 `ptrace.ProtoMarshaler.MarshalTraces(td)` 得到写盘字节（与 OTLP 请求体线格式兼容，回读仍用 `UnmarshalTraces`）。序列化在 `ConsumeTraces` 调用方的 goroutine、锁外完成，多个请求可并行。tail_sampling 声明 `MutatesData: true`，Collector 保证它拿到的 `td` 归自己所有，序列化期间不会被并发修改。
+2. 删除 `rawrequest` 包、`tailspoolreceiver` 模块和对象一致性检查；spool 模式改用标准 `otlp` receiver，gRPC 与 HTTP 都可用。WAL 与段格式不变。
+3. tail_sampling 前面可以放任意**同步**的 processor（attributes、transform、filter、resource、memory_limiter 等）；它们的结果会体现在求值和输出里，与官方内存路径一致。tail_sampling 之后不受限制。
+4. 仍然不能放在前面的是**异步** processor（batch、groupbytrace 等）：它们先向上游返回成功，之后才把数据交给 tail_sampling，ACK 早于写盘，kill 时丢失缓冲中的数据。这与官方内存路径前面放 batch 的风险相同，不是 spool 引入的；在 README 和配置说明中写明，不做启动校验。
+5. deadline：标准 otlp receiver 会把 gRPC deadline 放在 context 里向下传递，第二节的写盘点检查照常生效。processor 返回的 gRPC status 错误由 otlp receiver 原样返回，背压用 `codes.Unavailable`，客户端默认重试。
+6. spool 目录加 `flock` 独占锁，防止两个实例（或两个进程）共用同一目录。
 
-需要用户在 `service.extensions` 中加入 `tailspool_guard`，README 与配置校验错误信息里写明。
+### 代价
+
+每个请求多一次序列化，CPU 与反序列化同量级。在测试机按 PLAN.md 第三章 200 / 400 / 800 req/s 用例，对比原文方案的 CPU 秒、峰值 RSS 和 ACK 延迟，结果回写 PLAN.md。
 
 ### 测试
 
-- guard 单测：tail_sampling 前放 attributes / transform / filter / batch / memory_limiter，tailspool receiver 进多条 pipeline，tail_sampling 不在首位，connector 作为 receiver，均报错；tail_sampling 后放 attributes、transform、batch 均通过。
-- 组件测试：未配置 guard 时 processor `Start` 报错；构建完整 collector（复用 `bench/cmd/otelcol-tailspool`）验证错误配置在监听前退出、端口未被占用。
-- 回归：原地修改探针在新校验下无法启动。
+- e2e 差分改为不经 `rawrequest`，直接调用 `ConsumeTraces`，原有用例全部保持逐 span 一致。
+- 新增：tail_sampling 前放 attributes processor（改属性）和 filter processor（删部分 span、删整个 Resource），要求 spool 模式输出与同配置官方内存路径逐 span 一致，sink 收到修改后的值、被删 span 不出现。
+- bench 配置改用 otlp receiver，删去 `otelcol-tailspool` 中的 tailspool receiver。
 
 ## 2. 在真正登记前检查 deadline，并明确恢复期间的接流行为
 
@@ -53,13 +55,13 @@ v0.165 中，实现 `extensioncapabilities.ConfigSnapshotWatcher` 的 extension 
 1. **ACK 只取决于写盘。** spool 内新增“待处理队列”：`Register` 在 `s.mu` 内分配 seq、写段、追加并刷新 T 帧，把记录追加到队列尾部后立即返回；不再使用 `ingestMu`，也不在 RPC 路径上发送到主循环。
    - 主循环按 seq 从队列取记录，`Begin` / `End` 水位语义不变。spool 模式下 `workChan` 改为容量 1 的唤醒信号。
    - 队列中的记录在内存预算 `max_unprocessed_bytes`（默认 64 MiB）内携带已解码的拆分结果；超出预算只保留磁盘引用，主循环取到时回读解码，与恢复重放共用 `ReadRecord` + 拆分 + 未结算关联的路径。
-2. **deadline 检查移到写盘点。** 改为 `Register(ctx, raw, assocs, arrival)`，在取得 `s.mu` 之后、写段之前检查 `ctx.Err()`。可选 `min_deadline_remaining`（默认 0）：剩余时间小于该值时拒绝，进一步缩小“刷盘后、响应到达前过期”的窗口；该窗口无法消除，计入“ACK 丢失”的重复上界。
+2. **deadline 检查移到写盘点。** 改为 `Register(ctx, data, assocs, arrival)`，在取得 `s.mu` 之后、写段之前检查 `ctx.Err()`。可选 `min_deadline_remaining`（默认 0）：剩余时间小于该值时拒绝，进一步缩小“刷盘后、响应到达前过期”的窗口；该窗口无法消除，计入“ACK 丢失”的重复上界。
    - 锁内只有写段、刷 WAL 和轮转；`sync_on_rotate` 的 fsync 也在拿锁后检查之前完成，不会漏判。
    - 检查点重写目前也在 `s.mu` 内，可能让等锁时间达到百毫秒级，一并移到锁外（先冻结快照，再在锁外写文件和改名）。
 3. **到达时间用登记时刻。** 主循环处理新记录时传入 T 帧的 arrival，而不是处理时刻，使积压时截止时间不顺延，与恢复重放一致。
 4. **显式背压。** 写盘前检查待处理积压（记录数、字节数）与 spool 目录所在盘的可用空间，超过 `max_unprocessed_records` / `max_unprocessed_bytes_on_disk` 或低于 `min_free_disk` 时返回 `UNAVAILABLE`（OTLP 客户端默认重试）。未写盘即拒绝，不产生重复。
 5. **恢复期间的行为（定为：继续接流）。**
-   - receiver 在 Open 完成后即监听，ACK 延迟等于写盘延迟。
+   - processor `Start` 完成 Open 后返回，otlp receiver 随后监听，ACK 延迟等于写盘延迟。
    - 主循环先处理重放记录，再按 seq 处理恢复期间新登记的记录，顺序与未 kill 时一致。
    - 新 trace 的截止时间按各自到达时间计算；重放结束时已过期的 trace 在下一个 tick 决定，决策滞后通过指标暴露。
    - 恢复期间新记录同样受背压上限约束；上限按“目标恢复时长 × 峰值请求率”配置。
@@ -103,7 +105,7 @@ v0.165 中，实现 `extensioncapabilities.ConfigSnapshotWatcher` 的 extension 
 每个问题一个 commit，按依赖排序：
 
 1. 读盘失败（改动局限在 `internal/spool`，风险最低）。
-2. 登记 deadline 与待处理队列（改动 processor 主循环的取数方式，完成后重跑全部 e2e 差分与测试机 kill 用例）。
-3. 启动前直连校验（新增 guard extension，更新 bench 配置与 README）。
+2. 改为存 tail_sampling 看到的数据，删除 tailspool receiver 与 `rawrequest`（简化登记入口，为下一步铺路）。
+3. 登记 deadline 与待处理队列（改动 processor 主循环的取数方式）。
 
-每步完成后 `-race` 跑 processor、spool、receiver 全部测试；全部完成后在测试机复测 PLAN.md 第三章的用例，并加上 1 秒客户端超时与读错误注入两组，结果回写 PLAN.md。
+每步完成后 `-race` 跑 processor、spool 全部测试；全部完成后在测试机复测 PLAN.md 第三章的用例，并加上序列化开销对比、1 秒客户端超时、读错误注入三组，结果回写 PLAN.md。
