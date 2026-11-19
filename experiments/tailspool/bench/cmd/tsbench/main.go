@@ -178,9 +178,11 @@ func runLoad(args []string) {
 
 	begin := time.Now()
 	go func() {
-		for range time.Tick(5 * time.Second) {
-			el := time.Since(begin).Seconds()
-			log.Printf("load: %d requests acked, %d failed attempts, %.0f spans/s", sent.Load(), failed.Load(), float64(spans.Load())/el)
+		var last int64
+		for range time.Tick(time.Second) {
+			now := spans.Load()
+			log.Printf("sec acked=%d failed=%d spans_per_s=%d", sent.Load(), failed.Load(), now-last)
+			last = now
 		}
 	}()
 	for i := *start; i < w.requests; i++ {
