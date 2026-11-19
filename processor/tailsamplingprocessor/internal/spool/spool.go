@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -79,9 +78,8 @@ type Record struct {
 	open    int
 	keeps   int
 	done    bool
-	// prevRun records were registered before the last restart. If they
-	// still cannot be read after a few attempts, they are released.
-	prevRun      bool
+	// recovered marks records registered by a previous run.
+	recovered    bool
 	readFailures int
 }
 
@@ -117,28 +115,17 @@ type Spool struct {
 	memo    *memo
 	err     error
 
-	ready     []*Record
-	readyCond *sync.Cond
-	stopping  bool
-	workers   sync.WaitGroup
-	inflight  int64
-	stats     Stats
+	ready       []*Record
+	readyCond   *sync.Cond
+	retryTimers map[*time.Timer]struct{}
+	stopping    bool
+	workers     sync.WaitGroup
+	inflight    int64
+	stats       Stats
 
-	// retrying counts records waiting to retry a failed read.
-	retrying int
-	// badSegs are segments where a record of the previous run could not be
-	// read; their other records of the previous run get a single attempt.
-	badSegs        map[uint32]bool
-	prevRunDelay   time.Duration
-	minReadBackoff time.Duration
-	maxReadBackoff time.Duration
-	// readAt reads record bytes; tests replace it to inject failures.
-	readAt func(seg *segment, p []byte, off int64) (int, error)
+	// readAt reads stored request bytes; tests replace it to inject faults.
+	readAt func(seg *segment, buf []byte, off int64) (int, error)
 }
-
-// prevRunReadAttempts bounds the reads of a record of the previous run
-// before it is released as unreadable.
-const prevRunReadAttempts = 3
 
 // Stats are cumulative counters exposed for tests and benchmarks.
 type Stats struct {
@@ -149,19 +136,19 @@ type Stats struct {
 	DeliveredSpans   uint64
 	Redelivered      uint64
 	DeliveryFailures uint64
-	Evicted          uint64
-	Checkpoints      uint64
-	// ReadFailures counts failed reads of record bytes.
+	// ReadFailures counts failed reads of stored requests.
 	ReadFailures uint64
-	// ReleasedUnreadable counts records of the previous run released
-	// because they could not be read; their spans are lost.
+	// ReleasedUnreadable counts records of a previous run given up on
+	// because they could not be read.
 	ReleasedUnreadable      uint64
 	ReleasedUnreadableBytes uint64
-	LiveRecords             int
-	LiveSegments            int
-	PendingTraces           int
-	ReadyRecords            int
-	ReadRetryRecords        int
+	Evicted                 uint64
+	Checkpoints      uint64
+	LiveRecords      int
+	LiveSegments     int
+	PendingTraces    int
+	ReadyRecords     int
+	RetryingRecords  int
 }
 
 var errStopped = errors.New("tail spool is stopped")
@@ -319,7 +306,7 @@ func (s *Spool) Stats() Stats {
 	st.LiveSegments = len(s.segs)
 	st.PendingTraces = len(s.pending)
 	st.ReadyRecords = len(s.ready)
-	st.ReadRetryRecords = s.retrying
+	st.RetryingRecords = len(s.retryTimers)
 	return st
 }
 
@@ -342,7 +329,7 @@ func (s *Spool) settlePendingLocked(id pcommon.TraceID, keep bool) {
 }
 
 func (s *Spool) settleLocked(r *Record, i int, keep bool) {
-	if r.done || r.state[i] == kept || r.state[i] == dropped {
+	if r.state[i] == kept || r.state[i] == dropped {
 		return
 	}
 	if keep {
@@ -365,42 +352,6 @@ func (s *Spool) finishLocked(r *Record) {
 		return
 	}
 	s.appendLocked(&frame{kind: frameCommit, seq: r.seq})
-	s.releaseLocked(r)
-}
-
-// releaseUnreadableLocked commits a record whose bytes cannot be read, so
-// that its segment can be reclaimed. Its spans are lost.
-func (s *Spool) releaseUnreadableLocked(r *Record, cause error) {
-	if r.done {
-		return
-	}
-	s.logger.Error("Releasing unreadable tail spool record; its spans are lost",
-		zap.Uint64("seq", r.seq),
-		zap.Uint32("segment", r.seg.id),
-		zap.Int64("offset", r.off),
-		zap.Uint32("length", r.length),
-		zap.Int("associations", len(r.assocs)),
-		zap.Int("kept_associations", r.keeps),
-		zap.Error(cause))
-	s.ready = slices.DeleteFunc(s.ready, func(x *Record) bool { return x == r })
-	for i, st := range r.state {
-		if st != pending {
-			continue
-		}
-		id := r.assocs[i].ID
-		refs := slices.DeleteFunc(s.pending[id], func(ref assocRef) bool { return ref.rec == r })
-		if len(refs) == 0 {
-			delete(s.pending, id)
-		} else {
-			s.pending[id] = refs
-		}
-	}
-	s.stats.ReleasedUnreadable++
-	s.stats.ReleasedUnreadableBytes += uint64(r.length)
-	s.appendLocked(&frame{kind: frameCommit, seq: r.seq})
-	if err := s.log.flush(); err != nil {
-		s.fail(err)
-	}
 	s.releaseLocked(r)
 }
 

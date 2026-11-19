@@ -25,6 +25,16 @@ type segment struct {
 	f    *os.File
 	size int64
 	refs int
+	// unreadable marks a segment of a previous run whose records failed to
+	// read; its other records get a single attempt.
+	unreadable bool
+}
+
+func readSegment(seg *segment, buf []byte, off int64) (int, error) {
+	if seg.f == nil {
+		return 0, fmt.Errorf("segment %d is missing", seg.id)
+	}
+	return seg.f.ReadAt(buf, off)
 }
 
 func segmentPath(dir string, id uint32) string {
@@ -77,10 +87,8 @@ func (s *Spool) removeSegmentLocked(seg *segment) {
 		}
 	}
 	delete(s.segs, seg.id)
-	if seg.f != nil {
-		seg.f.Close()
-	}
-	if err := os.Remove(segmentPath(s.cfg.Directory, seg.id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	seg.f.Close()
+	if err := os.Remove(segmentPath(s.cfg.Directory, seg.id)); err != nil {
 		s.logger.Warn("Failed to remove tail spool segment", zap.Uint32("segment", seg.id), zap.Error(err))
 	}
 }
@@ -121,10 +129,8 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		memo:    newMemo(cfg.KeepMemo, cfg.DropMemo),
 		nextSeq: 1,
 
-		badSegs:        map[uint32]bool{},
-		prevRunDelay:   time.Second,
-		minReadBackoff: 100 * time.Millisecond,
-		maxReadBackoff: 30 * time.Second,
+		retryTimers: map[*time.Timer]struct{}{},
+		readAt:      readSegment,
 	}
 	s.readyCond = sync.NewCond(&s.mu)
 
@@ -182,6 +188,7 @@ func (rp *replay) apply(f frame) error {
 		r := &Record{
 			seq: f.seq, seg: seg, off: f.off, length: f.length, arrival: f.arrival,
 			assocs: f.assocs, state: make([]assocState, len(f.assocs)), open: len(f.assocs),
+			recovered: true,
 		}
 		seg.refs++
 		s.records[r.seq] = r
@@ -268,7 +275,7 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 		}
 		f, err := os.OpenFile(segmentPath(s.cfg.Directory, id), os.O_RDWR, 0)
 		if errors.Is(err, os.ErrNotExist) {
-			// Its records are released below.
+			seg.unreadable = true
 			continue
 		}
 		if err != nil {
@@ -282,15 +289,11 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 		seg.f, seg.size = f, info.Size()
 	}
 	for _, r := range s.sortedRecordsLocked() {
-		switch {
-		case r.seg.f == nil:
-			s.badSegs[r.seg.id] = true
+		if r.seg.f == nil {
 			s.releaseUnreadableLocked(r, fmt.Errorf("segment %d is missing", r.seg.id))
-		case r.off+int64(r.length) > r.seg.size:
-			s.badSegs[r.seg.id] = true
-			s.releaseUnreadableLocked(r, fmt.Errorf("record extends past the end of segment %d", r.seg.id))
-		default:
-			r.prevRun = true
+		} else if r.off+int64(r.length) > r.seg.size {
+			r.seg.unreadable = true
+			s.releaseUnreadableLocked(r, fmt.Errorf("record %d extends past segment %d", r.seq, r.seg.id))
 		}
 	}
 

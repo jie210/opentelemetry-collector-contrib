@@ -12,6 +12,16 @@ import (
 	"go.uber.org/zap"
 )
 
+// recoveredReadAttempts bounds reads of a record left by a previous run
+// before it is released as unreadable.
+const recoveredReadAttempts = 3
+
+var (
+	recoveredReadInterval = time.Second
+	readBackoffBase       = 100 * time.Millisecond
+	maxReadBackoff        = 30 * time.Second
+)
+
 // Start launches the delivery workers. Each worker hands at most one record
 // to the next consumer at a time, so at most MaxInflightRecords records can
 // be redelivered after a process kill.
@@ -30,6 +40,9 @@ func (s *Spool) Start() {
 func (s *Spool) Stop() error {
 	s.mu.Lock()
 	s.stopping = true
+	for t := range s.retryTimers {
+		t.Stop()
+	}
 	s.readyCond.Broadcast()
 	s.mu.Unlock()
 	s.workers.Wait()
@@ -73,7 +86,7 @@ func (s *Spool) worker() {
 		}
 		s.mu.Unlock()
 
-		delivered, err := s.deliver(r, keep)
+		delivered, readErr := s.deliver(r, keep)
 
 		s.mu.Lock()
 		s.inflight -= int64(r.length)
@@ -85,8 +98,8 @@ func (s *Spool) worker() {
 			}
 			s.releaseLocked(r)
 			s.maybeCheckpointLocked()
-		case err != nil:
-			s.readFailedLocked(r, err)
+		case readErr != nil:
+			s.readFailedLocked(r, readErr)
 		default:
 			s.ready = append(s.ready, r)
 		}
@@ -95,41 +108,76 @@ func (s *Spool) worker() {
 	}
 }
 
-// readFailedLocked schedules another delivery attempt of a record whose
-// bytes could not be read. Records of the current run are retried until
-// they can be read; records of the previous run are released after a few
-// attempts.
+// readFailedLocked schedules another delivery attempt of a record that could
+// not be read. Records of this run are retried until the process stops;
+// records left by a previous run are released after a few attempts.
 func (s *Spool) readFailedLocked(r *Record, err error) {
 	s.stats.ReadFailures++
 	r.readFailures++
-	if r.prevRun && (s.badSegs[r.seg.id] || r.readFailures >= prevRunReadAttempts) {
-		s.badSegs[r.seg.id] = true
+	if r.recovered && (r.readFailures >= recoveredReadAttempts || r.seg.unreadable) {
+		r.seg.unreadable = true
 		s.releaseUnreadableLocked(r, err)
 		return
 	}
-	delay := s.prevRunDelay
-	if !r.prevRun {
-		delay = min(s.minReadBackoff<<min(r.readFailures-1, 20), s.maxReadBackoff)
+	delay := recoveredReadInterval
+	if !r.recovered {
+		delay = min(maxReadBackoff, readBackoffBase<<min(r.readFailures-1, 10))
 	}
 	s.logger.Warn("Failed to read tail spool record, retrying",
-		zap.Uint64("seq", r.seq), zap.Int("failures", r.readFailures), zap.Duration("delay", delay), zap.Error(err))
-	s.retrying++
-	time.AfterFunc(delay, func() {
+		zap.Uint64("seq", r.seq), zap.Int("failures", r.readFailures), zap.Duration("backoff", delay), zap.Error(err))
+	if s.stopping {
+		return
+	}
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.retrying--
-		if s.stopping || r.done {
-			return
+		delete(s.retryTimers, t)
+		if !r.done && !s.stopping {
+			s.ready = append(s.ready, r)
+			s.readyCond.Broadcast()
 		}
-		s.ready = append(s.ready, r)
-		s.readyCond.Signal()
 	})
+	s.retryTimers[t] = struct{}{}
+}
+
+// releaseUnreadableLocked gives up on a record left by a previous run that
+// still cannot be read: its open associations settle as drop and the record
+// is committed so its segment can be reclaimed.
+func (s *Spool) releaseUnreadableLocked(r *Record, err error) {
+	if r.done {
+		return
+	}
+	s.logger.Error("Releasing unreadable tail spool record",
+		zap.Uint64("seq", r.seq), zap.Uint32("segment", r.seg.id), zap.Int64("offset", r.off),
+		zap.Uint32("length", r.length), zap.Int("associations", len(r.assocs)), zap.Int("kept", r.keeps),
+		zap.Error(err))
+	for i, st := range r.state {
+		if st == unsettled || st == pending {
+			s.appendLocked(&frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: false})
+			r.state[i] = dropped
+		}
+	}
+	r.open = 0
+	for i, x := range s.ready {
+		if x == r {
+			s.ready = append(s.ready[:i], s.ready[i+1:]...)
+			break
+		}
+	}
+	s.appendLocked(&frame{kind: frameCommit, seq: r.seq})
+	if err := s.log.flush(); err != nil {
+		s.fail(err)
+	}
+	s.stats.ReleasedUnreadable++
+	s.stats.ReleasedUnreadableBytes += uint64(r.length)
+	s.releaseLocked(r)
 }
 
 // deliver reads the record, keeps the spans of kept traces and hands them to
-// the next consumer, retrying the consumer until it succeeds or the spool
-// stops. It reports whether the record was delivered, or the read error that
-// prevented it.
+// the next consumer, retrying until it succeeds or the spool stops. It
+// reports whether the record was delivered, or the error that prevented
+// reading it.
 func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) (bool, error) {
 	td, err := s.readRecord(r)
 	if err != nil {
@@ -165,37 +213,36 @@ func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) (bool, error) {
 	}
 }
 
-// ReadRefeed decodes a record of the previous run whose fragments must be
-// processed again. A record that still cannot be read after a few attempts
-// is released and the read error returned; its spans are lost.
-func (s *Spool) ReadRefeed(r *Record) (ptrace.Traces, error) {
-	for {
+// ReadRecovered decodes a record left by a previous run so the processor can
+// process its fragments again. A record that cannot be read after a few
+// attempts is released and the error is returned.
+func (s *Spool) ReadRecovered(r *Record) (ptrace.Traces, error) {
+	for attempt := 1; ; attempt++ {
 		td, err := s.readRecord(r)
 		if err == nil {
 			return td, nil
 		}
 		s.mu.Lock()
 		s.stats.ReadFailures++
-		r.readFailures++
-		if s.badSegs[r.seg.id] || r.readFailures >= prevRunReadAttempts {
-			s.badSegs[r.seg.id] = true
+		if attempt >= recoveredReadAttempts || r.seg.unreadable {
+			r.seg.unreadable = true
 			s.releaseUnreadableLocked(r, err)
 			s.mu.Unlock()
 			return ptrace.Traces{}, err
 		}
-		delay := s.prevRunDelay
 		s.mu.Unlock()
-		time.Sleep(delay)
+		s.logger.Warn("Failed to read tail spool record, retrying",
+			zap.Uint64("seq", r.seq), zap.Int("attempt", attempt), zap.Error(err))
+		time.Sleep(recoveredReadInterval)
 	}
 }
 
+// ReadRecord decodes the record's stored request.
+func (s *Spool) ReadRecord(r *Record) (ptrace.Traces, error) { return s.readRecord(r) }
+
 func (s *Spool) readRecord(r *Record) (ptrace.Traces, error) {
 	buf := make([]byte, r.length)
-	read := s.readAt
-	if read == nil {
-		read = func(seg *segment, p []byte, off int64) (int, error) { return seg.f.ReadAt(p, off) }
-	}
-	if _, err := read(r.seg, buf, r.off); err != nil {
+	if _, err := s.readAt(r.seg, buf, r.off); err != nil {
 		return ptrace.Traces{}, fmt.Errorf("read record %d: %w", r.seq, err)
 	}
 	var u ptrace.ProtoUnmarshaler
