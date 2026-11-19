@@ -237,13 +237,12 @@ v0.165.1 的 16 个 `processor_tail_sampling_*` 指标保留原名、属性和�
 |---|---|
 | 折叠（`internal/sampling`） | 读取 span 的叶子策略按片段折叠，latency 显式折叠；`TraceData.Folded` 保存折叠状态，bytes_limiting 用累计的 `TracesSize`。tick 用折叠状态构造候选，决定后释放。 |
 | spool（`internal/spool`） | 段文件 + WAL（`[len][crc32c][payload]`，帧 H/T/K/D/V/L/C/W/M）。T 帧按片段登记 `(traceID, ResourceSpans 序号)` 关联；K/D/V 携带水位，水位之后的记录用 L 帧逐关联结算。keep / drop 两侧决定备忘各自按缓存容量（为 0 时按 num_traces）保留，检查点超过阈值时重写。交付由 `max_inflight_records` 个 worker 在锁外回读、过滤、调用下一个 consumer，成功后写 C 并释放段。 |
-| processor spool 模式 | 配置 `tail_sampling.spool`。接收时登记 WAL 后按记录顺序送入主循环，主循环逐片段走官方缓存命中、容量移除和折叠。恢复在主循环内串行执行：恢复决定备忘，按原到达时间重放未结算片段，保持原截止时间。Shutdown 不对待决 trace 求值，留给下次启动恢复。 |
-| tailspool receiver | OTLP/gRPC 入口，codec 保留解压后的请求原文，经 context 传给 processor；客户端已超时的请求不登记。 |
+| processor spool 模式 | 配置 `tail_sampling.spool`。接收时把 tail_sampling 收到的 `ptrace.Traces` 序列化写段、登记 WAL 后即 ACK，记录进入 spool 的待处理队列；主循环按 seq 取记录，逐片段走官方缓存命中、容量移除和折叠，到达时间取登记时刻。恢复在主循环内串行执行：恢复决定备忘，按原到达时间重放未结算片段，保持原截止时间；恢复期间照常接流，新记录排在重放之后。Shutdown 不对待决 trace 求值，留给下次启动恢复。前面可以放任意同步 processor，入口为标准 otlp receiver。 |
 | 确定性 | `splitResourceSpansByTrace` 按首次出现顺序输出，tick 批次按 trace ID 排序，使官方与 spool 两种模式可逐 span 对比。 |
 
 ### 与第二章设计的差异
 
-- 直连校验在运行时做：processor 要求 context 中的原文与本次 `ptrace.Traces` 为同一对象，否则拒绝请求，而不是在监听前报错。
+- 不存 receiver 收到的原文，改存 tail_sampling 收到的数据（见 `FIX-PLAN.md` 第 1 节），没有专用 receiver 和直连校验。
 - 决策 hook 看到的 `ReceivedBatches` 为空；依赖它的扩展未接入。
 - 恢复串行，没有 inbox 和 BOOTTIME 处理，墙钟回拨未覆盖。
 - 启动时拒绝：recordPolicy / useTracestate gate、span-ingest、tail_storage、多 shard、任一缓存为 0 时的 block_on_overflow、含 `Now(` 的 OTTL 条件；运行时拒绝策略和大小上限的热更新。
@@ -285,6 +284,8 @@ v0.165.1 的 16 个 `processor_tail_sampling_*` 指标保留原名、属性和�
 | 800 req/s | 第 20、45 秒 | 0 | 0 | 0 | 7（1） | 0.87–1.30 s | 7.1 s、6.7 s（151 万 / 20 万） |
 
 sink 延迟 50 ms 让交付几乎总在途，用来放大“已交给下游、C 未落盘”的窗口：7 次 kill 共重复 48 条记录，平均每次约 7 条，低于 `max_inflight_records`=16 的上限，每个重复 span 只多一份。被拒的客户端请求（连接拒绝）重试后没有产生重复。恢复期间 receiver 已在监听，新请求排在恢复之后处理。800 req/s 带容量压力的重启这次也逐 span 一致，但该场景只承诺二级近似。
+
+以上为修复前的结果。修复后的复测见 `FIX-PLAN.md` 的“实施状态与复测”。
 
 ### 尚未覆盖
 

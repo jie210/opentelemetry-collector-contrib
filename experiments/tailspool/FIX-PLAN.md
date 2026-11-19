@@ -113,3 +113,44 @@ spool 写盘的是 tailspool receiver 收到的原始请求字节，求值用的
 3. 登记 deadline 与待处理队列（改动 processor 主循环的取数方式）。
 
 每步完成后 `-race` 跑 processor、spool 全部测试；全部完成后在测试机复测 PLAN.md 第三章的用例，并加上序列化开销对比、1 秒客户端超时、读错误注入三组，结果回写 PLAN.md。
+
+## 实施状态与复测
+
+三步已按上述顺序提交：读盘失败 `e9b36427ea2`，存 tail_sampling 看到的数据 `0223f594381`，登记 deadline 与待处理队列 `eb8ed98cdca`。processor 模块全部测试在 `-race` 下通过。
+
+### 与方案的差异
+
+- 指标只进了 spool 的 `Stats`（`ReadFailures`、`RetryingRecords`、`ReleasedUnreadable*`、`RejectedExpired`、`RejectedBackpressure`、`Unprocessed*`），没有导出为 Collector 指标，也没有上报 `RecoverableError` 组件状态；登记等锁耗时没有统计。
+- 配置名：内存预算为 `max_unprocessed_memory`（默认 64 MiB），盘上积压上限为 `max_unprocessed_records` / `max_unprocessed_bytes`，另有 `min_free_disk`、`min_deadline_remaining`；后四项默认关闭。背压返回 `spool.ErrBackpressure`，otlp receiver 映射为 `Unavailable`。
+- 主循环的唤醒信号由 spool 提供（`Spool.Wake`），`workChan` 在 spool 模式下只用于通知关闭。溢出记录回读失败时主循环记下重试时间并用定时器唤醒，期间 tick 照常执行。
+- 不允许放在前面的异步 processor 只写进了 `Config.Spool` 的说明；README 目前没有 spool 章节。
+- 第 1 节的“前置 attributes / filter processor”用 processor 包内的单测代替：同一对象原地改属性并删掉一个 Resource 后交给 spool，sink 收到修改后的值、被删 span 不出现。第 2 节的“主循环阻塞数秒仍与未阻塞官方逐 span 一致”用单测代替：记录排队 2.1 秒后，其 trace 按登记时刻少等两个批次；手动 tick 的差分框架里批次按 tick 计，阻塞时长无法与官方对齐。
+- 读错误注入只在单测中做（注入 `readAt` 与截断段文件），测试机未做。
+
+### 测试机复测
+
+测试机重置后数据盘 `vdb` 未挂载，本次挂在 `/mnt/otelbench`（与第三章同一块盘），负载与工具同第三章。同一轮里用修复前的二进制（存原文，`bin-raw`）做对照，tsbench 新增成功请求的 ACK 延迟分位数和按状态码统计的失败次数。基线为第三章保存的官方运行结果。
+
+| 用例 | 版本 | CPU 秒 | 峰值 RSS | spool 盘峰值 | ACK p50 / p99 / p999 / 最大 | 与官方逐 span 对比 |
+|---|---|---|---|---|---|---|
+| 200 req/s | 修复后 | 48 | 372 MB | 558 MB | 0.9 / 12 / 250 / 336 ms | 完全一致 |
+| 200 req/s | 修复前 | 48 | 366 MB | 543 MB | 0.8 / 50 / 107 / 141 ms | 完全一致 |
+| 400 req/s | 修复后 | 91 | 629 MB | 1,051 MB | 0.8 / 11 / 121 / 386 ms | 见下文 |
+| 800 req/s | 修复后 | 142 | 603 MB | 1,064 MB | 0.9 / 12 / 118 / 203 ms | 完全一致 |
+| 800 req/s | 修复前 | 129 | 617 MB | 1,064 MB | 0.8 / 64 / 73 / 82 ms | 完全一致 |
+
+- 序列化开销：800 req/s 时 CPU 多约 10%，200 req/s 时持平；RSS 与盘占用基本不变。本轮 CPU 秒整体高于第三章（200 req/s 修复前 48 对 34），只做同轮对比。
+- ACK 延迟：开 `sync_on_rotate` 时，修复前每次轮转在锁内 fsync，p99 为 50–64 ms；修复后 fsync 移到后台，p99 降到 7–12 ms。100–300 ms 的尾部两版都有，且与 fsync 无关：200 req/s 下另跑三组，修复后开 / 关 fsync 的最大值为 225 / 263 ms，修复前关 fsync 为 224 ms。负载、collector、sink 同机运行，尾部主要来自环境，没有进一步分解。
+- 400 req/s：活动 trace 处在 num_traces 附近，修复后比第二次官方运行少 696 span，比第一次官方运行多 3,424 span，两次官方运行之间本身差 3,424 span，属于第三章所述的容量边界不确定性。
+
+**kill -9 后立即重启**
+
+| 用例 | 版本 | 客户端失败（按状态码） | 缺失 | 多出 | 重复 span / 份数（记录） | 重启到可接收 |
+|---|---|---|---|---|---|---|
+| 800 req/s，客户端超时 1 s，第 20、45 秒 kill | 修复后 | Unavailable 144 | 0 | 0 | 0 | 0.89 / 1.44 s |
+| 同上 | 修复前 | DeadlineExceeded 128、Unavailable 128 | 0 | 0 | 114 / 454（16） | 0.78 / 1.20 s |
+| 200 req/s，sink 延迟 50 ms，每 8 秒共 7 次 | 修复后 | Unavailable 448 | 0 | 0 | 747 / 747（48） | 0.12–0.79 s |
+
+- 1 秒超时下，修复前恢复期间 ACK 停顿，客户端超时 128 次，已登记的请求被重发，16 条记录重复、部分 span 送出 4 份；修复后恢复期间照常 ACK（全程最大 90 ms），没有超时，也没有重复。失败只发生在进程重启、端口未监听的窗口内。
+- 修复后恢复期间新请求先落盘排队，800 req/s 的 kill 用例 spool 盘峰值为 1,914 MB（修复前 1,075 MB），峰值 RSS 820 MB（修复前 612 MB），差额为恢复期间积压的记录与其内存中的拆分结果（受 `max_unprocessed_memory` 约束）。
+- 慢 sink 的 7 次 kill 共重复 48 条记录，与第三章相同，在每次 kill 不超过 `max_inflight_records`=16 的上限之内。
