@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,8 +29,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/status"
 )
 
 type workload struct {
@@ -136,6 +139,9 @@ func runLoad(args []string) {
 	work := make(chan int, *conc)
 	var wg sync.WaitGroup
 	var sent, failed, spans atomic.Int64
+	var mu sync.Mutex
+	var latencies []time.Duration
+	failures := map[codes.Code]int{}
 	for range *conc {
 		wg.Add(1)
 		go func() {
@@ -146,8 +152,17 @@ func runLoad(args []string) {
 				for {
 					attempts[i]++
 					ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+					began := time.Now()
 					_, err := client.Export(ctx, req)
+					took := time.Since(began)
 					cancel()
+					mu.Lock()
+					if err == nil {
+						latencies = append(latencies, took)
+					} else {
+						failures[status.Code(err)]++
+					}
+					mu.Unlock()
 					if err == nil {
 						break
 					}
@@ -178,6 +193,14 @@ func runLoad(args []string) {
 	close(work)
 	wg.Wait()
 	el := time.Since(begin)
+	slices.Sort(latencies)
+	q := func(p float64) time.Duration {
+		if len(latencies) == 0 {
+			return 0
+		}
+		return latencies[min(len(latencies)-1, int(p*float64(len(latencies))))].Round(100 * time.Microsecond)
+	}
+	log.Printf("ack latency: p50=%s p99=%s p999=%s max=%s; failed attempts by code: %v", q(0.5), q(0.99), q(0.999), q(1), failures)
 	log.Printf("load done: %d requests in %s, %d failed attempts, %.0f spans/s", sent.Load(), el.Round(time.Millisecond), failed.Load(), float64(spans.Load())/el.Seconds())
 	if *out != "" {
 		if err := os.WriteFile(*out, attempts, 0o644); err != nil {
