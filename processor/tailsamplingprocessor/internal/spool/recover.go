@@ -21,14 +21,11 @@ import (
 )
 
 type segment struct {
-	id   uint32
-	f    *os.File
-	size int64
-	refs int
-	// unreadable marks a segment of a previous run whose records failed to
-	// read; its other records get a single attempt.
-	unreadable bool
-	syncing    bool
+	id      uint32
+	f       *os.File
+	size    int64
+	refs    int
+	syncing bool
 }
 
 func readSegment(seg *segment, buf []byte, off int64) (int, error) {
@@ -222,7 +219,6 @@ func (rp *replay) apply(f frame) error {
 		r := &Record{
 			seq: f.seq, seg: seg, off: f.off, length: f.length, arrival: f.arrival,
 			assocs: f.assocs, state: make([]assocState, len(f.assocs)), open: len(f.assocs),
-			recovered: true,
 		}
 		seg.refs++
 		s.records[r.seq] = r
@@ -309,7 +305,6 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 		}
 		f, err := os.OpenFile(segmentPath(s.cfg.Directory, id), os.O_RDWR, 0)
 		if errors.Is(err, os.ErrNotExist) {
-			seg.unreadable = true
 			continue
 		}
 		if err != nil {
@@ -326,7 +321,6 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 		if r.seg.f == nil {
 			s.releaseUnreadableLocked(r, fmt.Errorf("segment %d is missing", r.seg.id))
 		} else if r.off+int64(r.length) > r.seg.size {
-			r.seg.unreadable = true
 			s.releaseUnreadableLocked(r, fmt.Errorf("record %d extends past segment %d", r.seq, r.seg.id))
 		}
 	}

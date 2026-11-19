@@ -263,9 +263,10 @@ func TestSpoolConfigValidation(t *testing.T) {
 	require.NoError(t, func() error { c := valid(); return c.Validate() }())
 
 	cases := map[string]func(*Config){
-		"directory":   func(c *Config) { c.Spool.Directory = "" },
-		"shards":      func(c *Config) { c.NumShards = 2 },
-		"span ingest": func(c *Config) { c.SamplingStrategy = samplingStrategySpanIngest },
+		"directory":    func(c *Config) { c.Spool.Directory = "" },
+		"shards":       func(c *Config) { c.NumShards = 2 },
+		"span ingest":  func(c *Config) { c.SamplingStrategy = samplingStrategySpanIngest },
+		"read retries": func(c *Config) { c.Spool.ReadRetries = -1 },
 		"block without sampled cache": func(c *Config) {
 			c.BlockOnOverflow = true
 			c.DecisionCache.NonSampledCacheSize = 10

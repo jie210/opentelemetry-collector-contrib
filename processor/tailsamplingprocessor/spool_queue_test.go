@@ -6,6 +6,7 @@ package tailsamplingprocessor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,7 +82,7 @@ func TestSpoolRetriesUnreadableWaitingRecord(t *testing.T) {
 	sink := newSpanCounter()
 	dir := t.TempDir()
 	p, c := newAlwaysSampleSpool(t, sink, func(cfg *Config) {
-		cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1}
+		cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1, ReadRetries: 10}
 	})
 	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
 	sp := spoolOf(p)
@@ -115,36 +116,42 @@ func TestSpoolRetriesUnreadableWaitingRecord(t *testing.T) {
 }
 
 func TestSpoolReleasesWaitingRecordThatStaysUnreadable(t *testing.T) {
-	sink := newSpanCounter()
-	dir := t.TempDir()
-	p, c := newAlwaysSampleSpool(t, sink, func(cfg *Config) {
-		cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1}
-	})
-	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
-	sp := spoolOf(p)
+	for _, retries := range []int{0, 2} {
+		t.Run(fmt.Sprintf("retries %d", retries), func(t *testing.T) {
+			sink := newSpanCounter()
+			dir := t.TempDir()
+			p, c := newAlwaysSampleSpool(t, sink, func(cfg *Config) {
+				cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1, ReadRetries: retries}
+			})
+			defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
+			sp := spoolOf(p)
 
-	unblock := blockLoop(c)
-	require.NoError(t, p.ConsumeTraces(context.Background(), singleSpan(1)))
-	segments, err := filepath.Glob(filepath.Join(dir, "segments", "*.otlp"))
-	require.NoError(t, err)
-	require.NoError(t, os.Truncate(segments[0], 0))
-	unblock()
+			unblock := blockLoop(c)
+			require.NoError(t, p.ConsumeTraces(context.Background(), singleSpan(1)))
+			segments, err := filepath.Glob(filepath.Join(dir, "segments", "*.otlp"))
+			require.NoError(t, err)
+			require.NoError(t, os.Truncate(segments[0], 0))
+			unblock()
 
-	require.Eventually(t, func() bool { return sp.Stats().ReleasedUnreadable == 1 }, 10*time.Second, time.Millisecond)
-	require.Zero(t, sp.Stats().UnprocessedRecords)
+			require.Eventually(t, func() bool { return sp.Stats().ReleasedUnreadable == 1 }, 10*time.Second, time.Millisecond)
+			st := sp.Stats()
+			require.Zero(t, st.UnprocessedRecords)
+			require.EqualValues(t, retries+1, st.ReadFailures)
 
-	// Later requests are processed again.
-	require.NoError(t, p.ConsumeTraces(context.Background(), singleSpan(2)))
-	waitSpoolTaken(t, p)
-	for range 2 {
-		c.waitForTick()
+			// Later requests are processed again.
+			require.NoError(t, p.ConsumeTraces(context.Background(), singleSpan(2)))
+			waitSpoolTaken(t, p)
+			for range 2 {
+				c.waitForTick()
+			}
+			require.Eventually(t, func() bool {
+				spans, _ := sink.snapshot()
+				return spans[pcommon.SpanID{2}] == 1
+			}, 5*time.Second, time.Millisecond)
+			spans, _ := sink.snapshot()
+			require.Zero(t, spans[pcommon.SpanID{1}])
+		})
 	}
-	require.Eventually(t, func() bool {
-		spans, _ := sink.snapshot()
-		return spans[pcommon.SpanID{2}] == 1
-	}, 5*time.Second, time.Millisecond)
-	spans, _ := sink.snapshot()
-	require.Zero(t, spans[pcommon.SpanID{1}])
 }
 
 // deepSpan returns a span whose attributes nest deeper than the protobuf
@@ -178,7 +185,7 @@ func TestSpoolDropsUndecodableRecord(t *testing.T) {
 			p, c := newAlwaysSampleSpool(t, sink, func(cfg *Config) {
 				cfg.DecisionWait = 2 * time.Second
 				cfg.PolicyCfgs = []PolicyCfg{{sharedPolicyCfg: sharedPolicyCfg{Name: "errors", Type: StatusCode, StatusCodeCfg: StatusCodeCfg{StatusCodes: []string{"ERROR"}}}}}
-				cfg.Spool = &SpoolConfig{Directory: t.TempDir(), MaxUnprocessedMemory: memory}
+				cfg.Spool = &SpoolConfig{Directory: t.TempDir(), MaxUnprocessedMemory: memory, ReadRetries: 3}
 			})
 			defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
 			sp := spoolOf(p)
@@ -244,12 +251,15 @@ func TestSpoolTickWaitsForQueuedFragments(t *testing.T) {
 		name string
 		// fillers are requests of unrelated traces between the spans.
 		fillers int
-		// fault empties the segment of request b, the only filler;
-		// recover restores it once its read failed.
+		// fault empties the segment of request b, the only filler, whose
+		// read is retried retries times; recover restores it once its read
+		// failed.
 		fault, recover bool
+		retries        int
 	}{
-		{name: "read retried then released", fillers: 1, fault: true},
-		{name: "read retried then recovered", fillers: 1, fault: true, recover: true},
+		{name: "read released at once", fillers: 1, fault: true},
+		{name: "read retried then released", fillers: 1, fault: true, retries: 4},
+		{name: "read retried then recovered", fillers: 1, fault: true, recover: true, retries: 4},
 		{name: "backlog read back", fillers: 20000},
 	}
 	for _, tc := range cases {
@@ -261,7 +271,7 @@ func TestSpoolTickWaitsForQueuedFragments(t *testing.T) {
 				cfg.DecisionWait = time.Second
 				cfg.NumTraces = 100000
 				cfg.PolicyCfgs = errorPolicy()
-				cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1}
+				cfg.Spool = &SpoolConfig{Directory: dir, MaxUnprocessedMemory: 1, ReadRetries: tc.retries}
 				if tc.fault {
 					cfg.Spool.SegmentSize = 1
 				}
@@ -299,7 +309,9 @@ func TestSpoolTickWaitsForQueuedFragments(t *testing.T) {
 				early, _ = sink.snapshot()
 				return early[pcommon.SpanID{4}] == 1
 			}, 5*time.Second, time.Millisecond)
-			require.Zero(t, early[pcommon.SpanID{3}], "trace 4 is not held with trace 1")
+			if lags := !tc.fault || tc.retries > 0; lags {
+				require.Zero(t, early[pcommon.SpanID{3}], "trace 4 is not held with trace 1")
+			}
 
 			require.Eventually(t, func() bool {
 				st := sp.Stats()

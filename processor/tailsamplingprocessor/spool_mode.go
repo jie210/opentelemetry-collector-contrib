@@ -60,6 +60,7 @@ func (tsp *tailSamplingSpanProcessor) startSpool() (*spool.Recovered, error) {
 		MaxUnprocessedBytes:   cfg.MaxUnprocessedBytes,
 		MinFreeDisk:           cfg.MinFreeDisk,
 		MinDeadlineRemaining:  cfg.MinDeadlineRemaining,
+		ReadRetries:           cfg.ReadRetries,
 	}, tsp.logger, tsp.nextConsumer)
 	if err != nil {
 		return nil, err
@@ -119,8 +120,8 @@ func (tsp *tailSamplingSpanProcessor) processNextSpooled(tickChan <-chan time.Ti
 		}
 		if err != nil {
 			// Skipping the record would move the watermark past its
-			// fragments, so later records wait for it until the spool
-			// gives up on it.
+			// fragments, so later records wait for it until its read
+			// retries run out.
 			tsp.spoolRetryDelay = min(max(2*tsp.spoolRetryDelay, 100*time.Millisecond), 30*time.Second)
 			tsp.spoolRetryAt = time.Now().Add(tsp.spoolRetryDelay)
 			time.AfterFunc(tsp.spoolRetryDelay, tsp.spool.Poke)

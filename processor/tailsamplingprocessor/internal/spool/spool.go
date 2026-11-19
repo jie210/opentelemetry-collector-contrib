@@ -63,6 +63,10 @@ type Config struct {
 	// MinDeadlineRemaining rejects requests whose deadline is closer, as the
 	// response may not reach the client in time.
 	MinDeadlineRemaining time.Duration
+	// ReadRetries is how many times a record that failed to read is read
+	// again, with a growing delay, before it is released with its spans
+	// dropped. A record that does not decode is released at once.
+	ReadRetries int
 }
 
 // ErrBackpressure is returned by Register while the spool is over one of
@@ -90,18 +94,16 @@ type Assoc struct {
 
 // Record is a registered request.
 type Record struct {
-	seq     uint64
-	seg     *segment
-	off     int64
-	length  uint32
-	arrival int64
-	assocs  []Assoc
-	state   []assocState
-	open    int
-	keeps   int
-	done    bool
-	// recovered marks records registered by a previous run.
-	recovered    bool
+	seq          uint64
+	seg          *segment
+	off          int64
+	length       uint32
+	arrival      int64
+	assocs       []Assoc
+	state        []assocState
+	open         int
+	keeps        int
+	done         bool
 	readFailures int
 	// payload is what the processor passed to Register, kept until the
 	// record is processed if it fits in MaxUnprocessedMemory.
@@ -385,9 +387,8 @@ func (s *Spool) Begun(seq uint64) bool {
 }
 
 // ReadUnprocessed decodes a queued record whose payload was not kept. A
-// record that does not decode, or still cannot be read after a few
-// attempts, is released with its fragments dropped, as it holds back every
-// later record; released reports it, and the queue moves on.
+// record that cannot be read and is not to be read again is released with
+// its fragments dropped; released reports it, and the queue moves on.
 func (s *Spool) ReadUnprocessed(r *Record) (td ptrace.Traces, released bool, err error) {
 	td, err = s.readRecord(r)
 	s.mu.Lock()
@@ -396,9 +397,7 @@ func (s *Spool) ReadUnprocessed(r *Record) (td ptrace.Traces, released bool, err
 		s.stats.UnprocessedReads++
 		return td, false, nil
 	}
-	s.stats.ReadFailures++
-	r.readFailures++
-	if !errors.Is(err, errUndecodable) && r.readFailures < unprocessedReadAttempts {
+	if s.retryReadLocked(r, err) {
 		return td, false, err
 	}
 	s.dequeueLocked(r)

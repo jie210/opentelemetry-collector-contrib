@@ -21,9 +21,15 @@ import (
 var errInjected = errors.New("injected read failure")
 
 func fastRetries(t *testing.T) {
-	interval, base := recoveredReadInterval, readBackoffBase
-	recoveredReadInterval, readBackoffBase = time.Millisecond, time.Millisecond
-	t.Cleanup(func() { recoveredReadInterval, readBackoffBase = interval, base })
+	base := readBackoffBase
+	readBackoffBase = time.Millisecond
+	t.Cleanup(func() { readBackoffBase = base })
+}
+
+func retryingConfig(dir string, retries int) Config {
+	cfg := testConfig(dir)
+	cfg.ReadRetries = retries
+	return cfg
 }
 
 // failingReads makes the first n reads fail, or every read when n < 0.
@@ -68,10 +74,10 @@ func sinkSpans(s *spanSink) int {
 	return len(s.spans)
 }
 
-func TestRuntimeReadFailureRetriesWithoutCommit(t *testing.T) {
+func TestDeliveryReadFailureIsRetried(t *testing.T) {
 	fastRetries(t)
 	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
-	s, _, err := Open(testConfig(t.TempDir()), zap.NewNop(), sink)
+	s, _, err := Open(retryingConfig(t.TempDir(), 3), zap.NewNop(), sink)
 	require.NoError(t, err)
 	failingReads(s, 3)
 	s.Start()
@@ -84,54 +90,34 @@ func TestRuntimeReadFailureRetriesWithoutCommit(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
-func TestPersistentReadFailureIsReleasedAfterRestart(t *testing.T) {
+func TestDeliveryReadFailureIsReleasedOnceRetriesRunOut(t *testing.T) {
 	fastRetries(t)
-	dir := t.TempDir()
-	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+	for _, retries := range []int{0, 2} {
+		dir := t.TempDir()
+		sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+		s, _, err := Open(retryingConfig(dir, retries), zap.NewNop(), sink)
+		require.NoError(t, err)
+		calls := failingReads(s, -1)
+		s.Start()
+		registerKept(t, s, 2)
+		require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, time.Millisecond)
+		st := s.Stats()
+		require.Equal(t, uint64(2), st.ReleasedUnreadable)
+		require.Equal(t, int64(2*(retries+1)), calls.Load(), "retries=%d", retries)
+		require.Zero(t, sinkSpans(sink))
+		require.NoError(t, s.Stop())
 
-	// A run that cannot read keeps retrying and never commits.
-	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
-	require.NoError(t, err)
-	failingReads(s, -1)
-	s.Start()
-	spans := registerKept(t, s, 2)
-	require.Eventually(t, func() bool { return s.Stats().ReadFailures >= 6 }, 5*time.Second, time.Millisecond)
-	require.Equal(t, 2, s.Stats().LiveRecords)
-	crash(s)
-
-	// A restart that can read delivers everything.
-	readable := t.TempDir()
-	require.NoError(t, os.CopyFS(readable, os.DirFS(dir)))
-	s, _, err = Open(testConfig(readable), zap.NewNop(), sink)
-	require.NoError(t, err)
-	s.Start()
-	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, time.Millisecond)
-	require.Equal(t, spans, sinkSpans(sink))
-	require.NoError(t, s.Stop())
-
-	// A restart that still cannot read releases the records after a few
-	// attempts each.
-	empty := &spanSink{spans: map[pcommon.SpanID]int{}}
-	s, _, err = Open(testConfig(dir), zap.NewNop(), empty)
-	require.NoError(t, err)
-	failingReads(s, -1)
-	s.Start()
-	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, time.Millisecond)
-	st := s.Stats()
-	require.Equal(t, uint64(2), st.ReleasedUnreadable)
-	require.LessOrEqual(t, st.ReadFailures, uint64(2*recoveredReadAttempts))
-	require.Zero(t, sinkSpans(empty))
-	require.NoError(t, s.Stop())
-
-	s, got, err := Open(testConfig(dir), zap.NewNop(), empty)
-	require.NoError(t, err)
-	require.Empty(t, got.Refeed)
-	require.Zero(t, s.Stats().LiveRecords)
-	require.NoError(t, s.Stop())
+		s, got, err := Open(testConfig(dir), zap.NewNop(), sink)
+		require.NoError(t, err)
+		require.Empty(t, got.Refeed)
+		require.Zero(t, s.Stats().LiveRecords)
+		require.NoError(t, s.Stop())
+	}
 }
 
 func TestReadRecoveredReleasesUnreadableRecord(t *testing.T) {
 	fastRetries(t)
+	const retries = 2
 	dir := t.TempDir()
 	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
 	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
@@ -152,18 +138,16 @@ func TestReadRecoveredReleasesUnreadableRecord(t *testing.T) {
 	s.Flush()
 	crash(s)
 
-	s, got, err := Open(testConfig(dir), zap.NewNop(), sink)
+	s, got, err := Open(retryingConfig(dir, retries), zap.NewNop(), sink)
 	require.NoError(t, err)
 	require.Len(t, got.Refeed, 2)
-	require.Same(t, got.Refeed[0].Record.seg, got.Refeed[1].Record.seg)
 	calls := failingReads(s, -1)
 	_, err = s.ReadRecovered(got.Refeed[0].Record)
 	require.ErrorIs(t, err, errInjected)
-	require.Equal(t, int64(recoveredReadAttempts), calls.Load())
-	// The other record of the same segment gets a single attempt.
+	require.Equal(t, int64(retries+1), calls.Load())
 	_, err = s.ReadRecovered(got.Refeed[1].Record)
 	require.ErrorIs(t, err, errInjected)
-	require.Equal(t, int64(recoveredReadAttempts+1), calls.Load())
+	require.Equal(t, int64(2*(retries+1)), calls.Load())
 	require.Equal(t, uint64(2), s.Stats().ReleasedUnreadable)
 	require.Zero(t, s.Stats().LiveRecords)
 	crash(s)
@@ -194,7 +178,7 @@ func deepRequest(t *testing.T, id pcommon.TraceID) ([]byte, []Assoc) {
 func TestUndecodableRecordIsReleasedAtDelivery(t *testing.T) {
 	dir := t.TempDir()
 	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
-	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
+	s, _, err := Open(retryingConfig(dir, 3), zap.NewNop(), sink)
 	require.NoError(t, err)
 	s.Start()
 	id := pcommon.TraceID{1}
@@ -246,14 +230,13 @@ func TestReadRecoveredReleasesUndecodableRecordAtOnce(t *testing.T) {
 	s.Flush()
 	crash(s)
 
-	s, got, err := Open(testConfig(dir), zap.NewNop(), sink)
+	s, got, err := Open(retryingConfig(dir, 3), zap.NewNop(), sink)
 	require.NoError(t, err)
 	require.Len(t, got.Refeed, 2)
 	_, err = s.ReadRecovered(got.Refeed[0].Record)
 	require.ErrorIs(t, err, errUndecodable)
 	require.Equal(t, uint64(1), s.Stats().ReadFailures, "not retried")
 	require.Equal(t, uint64(1), s.Stats().ReleasedUnreadable)
-	// The segment is fine, so its other record is read normally.
 	got1, err := s.ReadRecovered(got.Refeed[1].Record)
 	require.NoError(t, err)
 	require.Equal(t, td.SpanCount(), got1.SpanCount())
@@ -262,7 +245,7 @@ func TestReadRecoveredReleasesUndecodableRecordAtOnce(t *testing.T) {
 
 func TestReadUnprocessedReleasesUndecodableHead(t *testing.T) {
 	dir := t.TempDir()
-	cfg := testConfig(dir)
+	cfg := retryingConfig(dir, 3)
 	cfg.MaxUnprocessedMemory = 1
 	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
 	require.NoError(t, err)
@@ -309,38 +292,40 @@ func TestReadUnprocessedReleasesUndecodableHead(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
-func TestReadUnprocessedReleasesHeadAfterAttempts(t *testing.T) {
-	cfg := testConfig(t.TempDir())
-	cfg.MaxUnprocessedMemory = 1
-	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
-	require.NoError(t, err)
-	r := rand.New(rand.NewPCG(15, 16))
-	var next uint64
-	first := newTestRequest(t, r, &next, pcommon.TraceID{1})
-	second := newTestRequest(t, r, &next, pcommon.TraceID{2})
-	firstRec, err := first.register(s, context.Background(), "payload")
-	require.NoError(t, err)
-	secondRec, err := second.register(s, context.Background(), "payload")
-	require.NoError(t, err)
-	failingReads(s, unprocessedReadAttempts)
+func TestReadUnprocessedReleasesHeadOnceRetriesRunOut(t *testing.T) {
+	for _, retries := range []int{0, 4} {
+		cfg := retryingConfig(t.TempDir(), retries)
+		cfg.MaxUnprocessedMemory = 1
+		s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+		require.NoError(t, err)
+		r := rand.New(rand.NewPCG(15, 16))
+		var next uint64
+		first := newTestRequest(t, r, &next, pcommon.TraceID{1})
+		second := newTestRequest(t, r, &next, pcommon.TraceID{2})
+		firstRec, err := first.register(s, context.Background(), "payload")
+		require.NoError(t, err)
+		secondRec, err := second.register(s, context.Background(), "payload")
+		require.NoError(t, err)
+		failingReads(s, int64(retries+1))
 
-	for attempt := 1; attempt < unprocessedReadAttempts; attempt++ {
+		for attempt := 1; attempt <= retries; attempt++ {
+			_, released, err := s.ReadUnprocessed(firstRec)
+			require.ErrorIs(t, err, errInjected)
+			require.False(t, released, "attempt %d", attempt)
+		}
 		_, released, err := s.ReadUnprocessed(firstRec)
 		require.ErrorIs(t, err, errInjected)
-		require.False(t, released, "attempt %d", attempt)
-	}
-	_, released, err := s.ReadUnprocessed(firstRec)
-	require.ErrorIs(t, err, errInjected)
-	require.True(t, released)
+		require.True(t, released)
 
-	got, _, ok := s.Next()
-	require.True(t, ok)
-	require.Same(t, secondRec, got)
-	_, released, err = s.ReadUnprocessed(secondRec)
-	require.NoError(t, err)
-	require.False(t, released)
-	require.Equal(t, uint64(1), s.Stats().ReleasedUnreadable)
-	require.NoError(t, s.Stop())
+		got, _, ok := s.Next()
+		require.True(t, ok)
+		require.Same(t, secondRec, got)
+		_, released, err = s.ReadUnprocessed(secondRec)
+		require.NoError(t, err)
+		require.False(t, released)
+		require.Equal(t, uint64(1), s.Stats().ReleasedUnreadable)
+		require.NoError(t, s.Stop())
+	}
 }
 
 func TestOpenReleasesRecordsOfDamagedSegments(t *testing.T) {

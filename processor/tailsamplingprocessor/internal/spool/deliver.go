@@ -13,25 +13,29 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	// recoveredReadAttempts bounds reads of a record left by a previous run
-	// before it is released as unreadable.
-	recoveredReadAttempts = 3
-	// unprocessedReadAttempts bounds reads of the oldest unprocessed record,
-	// which holds back every record registered after it.
-	unprocessedReadAttempts = 5
-)
-
 // errUndecodable marks stored bytes that read fine but do not decode, such
 // as a request nested deeper than the protobuf decoder accepts. Reading
 // them again cannot succeed.
 var errUndecodable = errors.New("stored request cannot be decoded")
 
 var (
-	recoveredReadInterval = time.Second
-	readBackoffBase       = 100 * time.Millisecond
-	maxReadBackoff        = 30 * time.Second
+	readBackoffBase = 100 * time.Millisecond
+	maxReadBackoff  = 30 * time.Second
 )
+
+// retryReadLocked counts a failed read of r and reports whether to read it
+// again: up to ReadRetries times, unless it does not decode.
+func (s *Spool) retryReadLocked(r *Record, err error) bool {
+	s.stats.ReadFailures++
+	r.readFailures++
+	return !errors.Is(err, errUndecodable) && r.readFailures <= s.cfg.ReadRetries
+}
+
+// readBackoff is the delay before reading again a record that failed to
+// read the given number of times.
+func readBackoff(failures int) time.Duration {
+	return min(maxReadBackoff, readBackoffBase<<min(failures-1, 10))
+}
 
 // Start launches the delivery workers. Each worker hands at most one record
 // to the next consumer at a time, so at most MaxInflightRecords records can
@@ -122,25 +126,13 @@ func (s *Spool) worker() {
 }
 
 // readFailedLocked schedules another delivery attempt of a record that could
-// not be read. A record that does not decode is released at once. Other
-// failures of records of this run are retried until the process stops;
-// records left by a previous run are released after a few attempts.
+// not be read, or releases it once it is not to be read again.
 func (s *Spool) readFailedLocked(r *Record, err error) {
-	s.stats.ReadFailures++
-	r.readFailures++
-	if errors.Is(err, errUndecodable) {
+	if !s.retryReadLocked(r, err) {
 		s.releaseUnreadableLocked(r, err)
 		return
 	}
-	if r.recovered && (r.readFailures >= recoveredReadAttempts || r.seg.unreadable) {
-		r.seg.unreadable = true
-		s.releaseUnreadableLocked(r, err)
-		return
-	}
-	delay := recoveredReadInterval
-	if !r.recovered {
-		delay = min(maxReadBackoff, readBackoffBase<<min(r.readFailures-1, 10))
-	}
+	delay := readBackoff(r.readFailures)
 	s.logger.Warn("Failed to read tail spool record, retrying",
 		zap.Uint64("seq", r.seq), zap.Int("failures", r.readFailures), zap.Duration("backoff", delay), zap.Error(err))
 	if s.stopping {
@@ -232,31 +224,25 @@ func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) (bool, error) {
 }
 
 // ReadRecovered decodes a record left by a previous run so the processor can
-// process its fragments again. A record that does not decode, or cannot be
-// read after a few attempts, is released and the error is returned.
+// process its fragments again. A record that cannot be read is released and
+// the error is returned.
 func (s *Spool) ReadRecovered(r *Record) (ptrace.Traces, error) {
-	for attempt := 1; ; attempt++ {
+	for {
 		td, err := s.readRecord(r)
 		if err == nil {
 			return td, nil
 		}
 		s.mu.Lock()
-		s.stats.ReadFailures++
-		if errors.Is(err, errUndecodable) {
-			s.releaseUnreadableLocked(r, err)
-			s.mu.Unlock()
-			return ptrace.Traces{}, err
-		}
-		if attempt >= recoveredReadAttempts || r.seg.unreadable {
-			r.seg.unreadable = true
+		if !s.retryReadLocked(r, err) {
 			s.releaseUnreadableLocked(r, err)
 			s.mu.Unlock()
 			return ptrace.Traces{}, err
 		}
 		s.mu.Unlock()
+		delay := readBackoff(r.readFailures)
 		s.logger.Warn("Failed to read tail spool record, retrying",
-			zap.Uint64("seq", r.seq), zap.Int("attempt", attempt), zap.Error(err))
-		time.Sleep(recoveredReadInterval)
+			zap.Uint64("seq", r.seq), zap.Int("failures", r.readFailures), zap.Duration("backoff", delay), zap.Error(err))
+		time.Sleep(delay)
 	}
 }
 

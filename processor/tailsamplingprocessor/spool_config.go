@@ -48,6 +48,11 @@ type SpoolConfig struct {
 	// they are about to be written, as the client may give up before the
 	// response arrives and retry. Zero only refuses expired requests.
 	MinDeadlineRemaining time.Duration `mapstructure:"min_deadline_remaining"`
+	// ReadRetries is how many times a stored request that failed to read
+	// back is read again, with a growing delay, before its spans are
+	// dropped. A waiting request being retried holds back those after it.
+	// Zero drops them at the first failure.
+	ReadRetries int `mapstructure:"read_retries"`
 }
 
 func (cfg *SpoolConfig) withDefaults() SpoolConfig {
@@ -82,6 +87,9 @@ func (cfg *Config) validateSpool() error {
 	}
 	if cfg.TailStorageID != nil {
 		return errors.New("spool cannot be combined with tail_storage")
+	}
+	if cfg.Spool.ReadRetries < 0 {
+		return errors.New("spool.read_retries must not be negative")
 	}
 	if cfg.BlockOnOverflow {
 		// A decided trace only leaves memory once its decision is cached, so
