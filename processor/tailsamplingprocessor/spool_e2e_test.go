@@ -20,7 +20,6 @@ import (
 	"go.opentelemetry.io/collector/processor/processortest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/metadata"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/rawrequest"
 )
 
 // withManualTicks makes ingestion synchronous and ticks explicit while
@@ -149,14 +148,6 @@ func newDiffProcessor(t *testing.T, cfg Config, next consumer.Traces) (processor
 	return p, c
 }
 
-func consumeSpooled(t *testing.T, p processor.Traces, td ptrace.Traces) {
-	var m ptrace.ProtoMarshaler
-	raw, err := m.MarshalTraces(td)
-	require.NoError(t, err)
-	ctx := rawrequest.NewContext(context.Background(), &rawrequest.Request{Raw: raw, Traces: td})
-	require.NoError(t, p.ConsumeTraces(ctx, td))
-}
-
 func onlinePolicies() []PolicyCfg {
 	return []PolicyCfg{
 		{sharedPolicyCfg: sharedPolicyCfg{Name: "errors", Type: StatusCode, StatusCodeCfg: StatusCodeCfg{StatusCodes: []string{"ERROR"}}}},
@@ -281,33 +272,58 @@ func TestSpoolConfigValidation(t *testing.T) {
 	}
 }
 
-func TestSpoolRejectsRequestWithoutRawBytes(t *testing.T) {
+func newAlwaysSampleSpool(t *testing.T, sink *spanCounter) (processor.Traces, *testTSPController) {
 	cfg := Config{
 		DecisionWait:     time.Second,
 		NumTraces:        10,
 		SamplingStrategy: samplingStrategyTraceComplete,
-		PolicyCfgs:       onlinePolicies(),
+		PolicyCfgs:       []PolicyCfg{{sharedPolicyCfg: sharedPolicyCfg{Name: "all", Type: AlwaysSample}}},
 		Spool:            &SpoolConfig{Directory: t.TempDir()},
 	}
-	p, _ := newDiffProcessor(t, cfg, newSpanCounter())
+	return newDiffProcessor(t, cfg, sink)
+}
+
+func TestSpoolDeliversDataModifiedUpstream(t *testing.T) {
+	sink := newSpanCounter()
+	p, c := newAlwaysSampleSpool(t, sink)
+	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
+
+	td := ptrace.NewTraces()
+	for i := range 2 {
+		span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+		span.SetTraceID(pcommon.TraceID{1})
+		span.SetSpanID(pcommon.SpanID{byte(i + 1)})
+		span.Attributes().PutStr("k", "received")
+	}
+	// What a processor in front of tail_sampling does to the same object.
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("k", "modified")
+	td.ResourceSpans().RemoveIf(func(rs ptrace.ResourceSpans) bool {
+		return rs.ScopeSpans().At(0).Spans().At(0).SpanID() == pcommon.SpanID{2}
+	})
+
+	require.NoError(t, p.ConsumeTraces(context.Background(), td))
+	for range 2 {
+		c.waitForTick()
+	}
+	require.Eventually(t, func() bool {
+		spans, _ := sink.snapshot()
+		return len(spans) > 0
+	}, 5*time.Second, time.Millisecond)
+	spans, body := sink.snapshot()
+	require.Equal(t, map[pcommon.SpanID]int{{1}: 1}, spans)
+	require.Contains(t, body[pcommon.SpanID{1}], "k:modified")
+}
+
+func TestSpoolRejectsExpiredRequest(t *testing.T) {
+	p, _ := newAlwaysSampleSpool(t, newSpanCounter())
 	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
 
 	td := ptrace.NewTraces()
 	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetTraceID(pcommon.TraceID{1})
-	require.ErrorIs(t, p.ConsumeTraces(context.Background(), td), errSpoolNeedsRawRequest)
-
-	// A processor in between would hand over a different pdata object.
-	var m ptrace.ProtoMarshaler
-	raw, err := m.MarshalTraces(td)
-	require.NoError(t, err)
-	other := ptrace.NewTraces()
-	td.CopyTo(other)
-	ctx := rawrequest.NewContext(context.Background(), &rawrequest.Request{Raw: raw, Traces: td})
-	require.ErrorIs(t, p.ConsumeTraces(ctx, other), errSpoolNeedsRawRequest)
-
-	expired, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	require.ErrorIs(t, p.ConsumeTraces(expired, td), context.DeadlineExceeded)
+	require.Zero(t, p.(*shardedProcessor).shards[0].spool.Stats().Registered)
 }
 
 func runSpoolDiff(t *testing.T, cfg Config, seed uint64, restart, exact bool) {
@@ -328,7 +344,7 @@ func runSpoolDiff(t *testing.T, cfg Config, seed uint64, restart, exact bool) {
 			cp := ptrace.NewTraces()
 			td.CopyTo(cp)
 			require.NoError(t, official.ConsumeTraces(context.Background(), cp))
-			consumeSpooled(t, spooled, td)
+			require.NoError(t, spooled.ConsumeTraces(context.Background(), td))
 		}
 		oc.waitForTick()
 		sc.waitForTick()

@@ -19,13 +19,12 @@ import (
 	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/tailspoolreceiver"
 )
 
 func components() (otelcol.Factories, error) {
 	var err error
 	f := otelcol.Factories{Telemetry: otelconftelemetry.NewFactory()}
-	if f.Receivers, err = otelcol.MakeFactoryMap[receiver.Factory](otlpreceiver.NewFactory(), tailspoolreceiver.NewFactory()); err != nil {
+	if f.Receivers, err = otelcol.MakeFactoryMap[receiver.Factory](otlpreceiver.NewFactory()); err != nil {
 		return f, err
 	}
 	if f.Processors, err = otelcol.MakeFactoryMap[processor.Factory](tailsamplingprocessor.NewFactory()); err != nil {

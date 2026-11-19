@@ -4,7 +4,6 @@ go 1.26.0
 
 require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor v0.165.1
-	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/tailspoolreceiver v0.165.1
 	go.opentelemetry.io/collector/component v1.71.0
 	go.opentelemetry.io/collector/confmap v1.71.0
 	go.opentelemetry.io/collector/confmap/provider/envprovider v1.71.0
@@ -222,8 +221,6 @@ require (
 )
 
 replace github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor => ../../../processor/tailsamplingprocessor
-
-replace github.com/open-telemetry/opentelemetry-collector-contrib/receiver/tailspoolreceiver => ../../../receiver/tailspoolreceiver
 
 replace github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest => ../../../pkg/pdatatest
 

@@ -1,8 +1,9 @@
 receivers:
-  tailspool:
-    grpc:
-      endpoint: 127.0.0.1:4317
-      max_recv_msg_size_mib: 64
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+        max_recv_msg_size_mib: 64
 
 processors:
   tail_sampling:
@@ -38,6 +39,6 @@ service:
     logs: {level: info}
   pipelines:
     traces:
-      receivers: [tailspool]
+      receivers: [otlp]
       processors: [tail_sampling]
       exporters: [otlp]

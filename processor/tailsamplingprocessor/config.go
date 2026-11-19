@@ -381,9 +381,10 @@ type Config struct {
 	// and values greater than 1 are not supported with tail_storage.
 	// Defaults to 1 (single event loop, original behavior).
 	NumShards uint32 `mapstructure:"num_shards"`
-	// Spool keeps the raw requests of pending traces on disk instead of their
-	// spans in memory. It requires the tailspool receiver directly in front
-	// of the processor.
+	// Spool keeps the requests of pending traces on disk instead of their
+	// spans in memory. Processors in front of it must pass requests on
+	// synchronously: one that buffers, such as batch, acknowledges data
+	// before it reaches the spool.
 	Spool *SpoolConfig `mapstructure:"spool"`
 }
 

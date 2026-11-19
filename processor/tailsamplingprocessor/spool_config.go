@@ -25,7 +25,7 @@ type SpoolConfig struct {
 	// not yet committed; it bounds redelivery after a process kill.
 	// Defaults to 16.
 	MaxInflightRecords int `mapstructure:"max_inflight_records"`
-	// MaxInflightBytes bounds the raw bytes of those requests. Defaults to
+	// MaxInflightBytes bounds the stored bytes of those requests. Defaults to
 	// 64 MiB.
 	MaxInflightBytes int64 `mapstructure:"max_inflight_bytes"`
 }

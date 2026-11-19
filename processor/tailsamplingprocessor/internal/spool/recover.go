@@ -119,7 +119,18 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 	if err := ensureDir(cfg.Directory); err != nil {
 		return nil, nil, err
 	}
+	lock, err := lockDir(cfg.Directory)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			lock.Close()
+		}
+	}()
 	s := &Spool{
+		lock:    lock,
 		cfg:     cfg,
 		logger:  logger,
 		next:    next,
@@ -159,6 +170,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		f.Close()
 		return nil, nil, err
 	}
+	opened = true
 	return s, rec, nil
 }
 

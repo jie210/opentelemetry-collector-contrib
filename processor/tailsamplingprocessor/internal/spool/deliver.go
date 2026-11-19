@@ -54,6 +54,7 @@ func (s *Spool) Stop() error {
 	for _, seg := range s.segs {
 		seg.f.Close()
 	}
+	s.lock.Close()
 	if err != nil {
 		return err
 	}

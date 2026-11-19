@@ -1,8 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Package spool keeps raw OTLP trace requests on disk while the tail sampling
-// processor decides, and delivers the kept spans from the original bytes.
+// Package spool keeps serialized OTLP trace requests on disk while the tail
+// sampling processor decides, and delivers the kept spans from them.
 //
 // Each request is appended once to a segment file and registered in a log
 // before it is acknowledged. A record associates the request with every trace
@@ -39,7 +39,7 @@ type Config struct {
 	// MaxInflightRecords bounds records handed to the next consumer but not
 	// yet committed, which bounds redelivery after a process kill.
 	MaxInflightRecords int
-	// MaxInflightBytes bounds the raw bytes of those records.
+	// MaxInflightBytes bounds the stored bytes of those records.
 	MaxInflightBytes int64
 	// KeepMemo and DropMemo bound the keep and drop decisions restored after
 	// a restart.
@@ -66,7 +66,7 @@ type Assoc struct {
 	Resource uint32
 }
 
-// Record is a registered raw request.
+// Record is a registered request.
 type Record struct {
 	seq     uint64
 	seg     *segment
@@ -103,6 +103,8 @@ type Spool struct {
 	cfg    Config
 	logger *zap.Logger
 	next   consumer.Traces
+	// lock keeps another process from opening the same directory.
+	lock *os.File
 
 	mu      sync.Mutex
 	log     *logWriter
@@ -143,12 +145,12 @@ type Stats struct {
 	ReleasedUnreadable      uint64
 	ReleasedUnreadableBytes uint64
 	Evicted                 uint64
-	Checkpoints      uint64
-	LiveRecords      int
-	LiveSegments     int
-	PendingTraces    int
-	ReadyRecords     int
-	RetryingRecords  int
+	Checkpoints             uint64
+	LiveRecords             int
+	LiveSegments            int
+	PendingTraces           int
+	ReadyRecords            int
+	RetryingRecords         int
 }
 
 var errStopped = errors.New("tail spool is stopped")

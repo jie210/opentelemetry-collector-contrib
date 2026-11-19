@@ -19,7 +19,7 @@ import (
 const (
 	// frameHeader starts a checkpoint: version and next record sequence.
 	frameHeader = 'H'
-	// frameRecord registers a raw request: seq, segment, offset, length,
+	// frameRecord registers a request: seq, segment, offset, length,
 	// arrival time and its associations.
 	frameRecord = 'T'
 	// frameKeep and frameDrop publish a decision for every association

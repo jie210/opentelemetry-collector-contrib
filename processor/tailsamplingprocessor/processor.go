@@ -114,7 +114,7 @@ type tailSamplingSpanProcessor struct {
 	// this is used in tests to produce deterministic ticks.
 	tickChan chan chan struct{}
 
-	// spool, when configured, holds the raw requests of pending traces and
+	// spool, when configured, holds the requests of pending traces and
 	// foldPlan the state kept per trace in their place.
 	spool     *spool.Spool
 	foldPlan  *sampling.FoldPlan

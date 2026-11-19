@@ -13,14 +13,11 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/rawrequest"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/sampling"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/telemetry"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/pkg/samplingpolicy"
 )
-
-var errSpoolNeedsRawRequest = errors.New("tail_sampling spool requires the tailspool receiver directly in front of it")
 
 // startSpool folds the policies, opens the spool and returns what must be
 // restored before new data is processed.
@@ -67,19 +64,21 @@ func (tsp *tailSamplingSpanProcessor) startSpool() (*spool.Recovered, error) {
 	return recovered, nil
 }
 
-// consumeSpooled registers the raw request and queues its trace fragments.
-// The request is acknowledged once it is registered.
+// consumeSpooled registers the request and queues its trace fragments. The
+// request is acknowledged once it is registered.
 func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptrace.Traces) error {
-	req := rawrequest.FromContext(ctx)
-	if req == nil || req.Traces != td {
-		return errSpoolNeedsRawRequest
-	}
 	// A request the client already gave up on would be registered twice
 	// when the load balancer retries it.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	// Splitting moves the spans out of td.
+	var m ptrace.ProtoMarshaler
+	data, err := m.MarshalTraces(td)
+	if err != nil {
+		return err
+	}
 	var assocs []spool.Assoc
 	var batches []traceBatch
 	for ri, rss := range td.ResourceSpans().All() {
@@ -93,7 +92,7 @@ func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptr
 	// Records must reach the loop in sequence order.
 	tsp.ingestMu.Lock()
 	defer tsp.ingestMu.Unlock()
-	rec, err := tsp.spool.Register(req.Raw, assocs, time.Now())
+	rec, err := tsp.spool.Register(data, assocs, time.Now())
 	if err != nil {
 		return err
 	}

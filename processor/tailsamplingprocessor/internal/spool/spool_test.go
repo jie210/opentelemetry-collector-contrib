@@ -7,6 +7,7 @@ import (
 	"context"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -106,6 +107,7 @@ func crash(s *Spool) {
 	for _, seg := range s.segs {
 		seg.f.Close()
 	}
+	s.lock.Close()
 }
 
 func makeRequest(r *rand.Rand, traces []pcommon.TraceID, nextSpan *uint64) (ptrace.Traces, []Assoc) {
@@ -317,6 +319,26 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 		}
 		require.NoError(t, s.Stop())
 	}
+}
+
+func TestOpenLocksDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no directory lock on windows")
+	}
+	dir := t.TempDir()
+	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	_, _, err = Open(testConfig(dir), zap.NewNop(), sink)
+	require.ErrorContains(t, err, "in use")
+	require.NoError(t, s.Stop())
+
+	s, _, err = Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	crash(s)
+	s, _, err = Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	require.NoError(t, s.Stop())
 }
 
 func TestSpoolRemovesSegmentsAfterCommit(t *testing.T) {
