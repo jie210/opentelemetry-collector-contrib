@@ -28,6 +28,7 @@ type segment struct {
 	// unreadable marks a segment of a previous run whose records failed to
 	// read; its other records get a single attempt.
 	unreadable bool
+	syncing    bool
 }
 
 func readSegment(seg *segment, buf []byte, off int64) (int, error) {
@@ -58,11 +59,6 @@ func (s *Spool) openSegmentLocked(id uint32) (*segment, error) {
 
 func (s *Spool) rotate() error {
 	old := s.active
-	if s.cfg.SyncOnRotate {
-		if err := old.f.Sync(); err != nil {
-			return fmt.Errorf("sync segment %d: %w", old.id, err)
-		}
-	}
 	seg, err := s.openSegmentLocked(old.id + 1)
 	if err != nil {
 		return err
@@ -71,13 +67,37 @@ func (s *Spool) rotate() error {
 		return fmt.Errorf("segment %d already has data", seg.id)
 	}
 	s.active = seg
+	if s.cfg.SyncOnRotate {
+		old.syncing = true
+		s.background.Add(1)
+		go s.syncSegment(old)
+	}
 	if old.refs == 0 {
 		s.removeSegmentLocked(old)
 	}
 	return nil
 }
 
+// syncSegment fsyncs a sealed segment, which is no longer written.
+func (s *Spool) syncSegment(seg *segment) {
+	defer s.background.Done()
+	err := seg.f.Sync()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seg.syncing = false
+	if err != nil {
+		s.fail(fmt.Errorf("sync segment %d: %w", seg.id, err))
+	}
+	if seg.refs == 0 && s.segs[seg.id] == seg {
+		s.removeSegmentLocked(seg)
+	}
+}
+
 func (s *Spool) removeSegmentLocked(seg *segment) {
+	// syncSegment removes it once done.
+	if seg.syncing {
+		return
+	}
 	// The commits that released the segment must reach the file first, or a
 	// restart would find registrations pointing into a removed segment.
 	if s.log != nil {
@@ -139,6 +159,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		pending: map[pcommon.TraceID][]assocRef{},
 		memo:    newMemo(cfg.KeepMemo, cfg.DropMemo),
 		nextSeq: 1,
+		wake:    make(chan struct{}, 1),
 
 		retryTimers: map[*time.Timer]struct{}{},
 		readAt:      readSegment,
@@ -362,55 +383,75 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 	return rec, s.err
 }
 
+// maybeCheckpointLocked starts a checkpoint once the log has grown well past
+// the last one, which keeps a large live state from being rewritten over and
+// over.
 func (s *Spool) maybeCheckpointLocked() {
-	if s.cfg.CheckpointBytes > 0 && s.log.size > s.cfg.CheckpointBytes {
-		s.checkpointLocked()
+	if s.cfg.CheckpointBytes <= 0 || s.checkpointing || s.stopping || s.err != nil {
+		return
 	}
+	if s.log.size <= max(s.cfg.CheckpointBytes, 2*s.lastSnapshot) {
+		return
+	}
+	frames := s.snapshotLocked()
+	s.checkpointing = true
+	s.log.tail = make([]byte, 0, 64<<10)
+	s.background.Add(1)
+	go s.checkpoint(frames)
+}
+
+// checkpoint writes the snapshot outside the lock while the current log
+// keeps receiving frames and a copy of them, then appends the copy to the
+// snapshot and atomically replaces the log with it.
+func (s *Spool) checkpoint(frames []frame) {
+	defer s.background.Done()
+	tmp := logPath(s.cfg.Directory) + ".tmp"
+	w, err := writeSnapshot(tmp, frames)
+	if s.snapshotWritten != nil {
+		s.snapshotWritten()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tail := s.log.tail
+	s.log.tail = nil
+	s.checkpointing = false
+	if err != nil {
+		s.fail(fmt.Errorf("write checkpoint: %w", err))
+		return
+	}
+	if s.stopping || s.err != nil {
+		w.f.Close()
+		os.Remove(tmp)
+		return
+	}
+	snapshot := w.size
+	if err := w.appendEncoded(tail); err != nil {
+		w.f.Close()
+		s.fail(fmt.Errorf("write checkpoint: %w", err))
+		return
+	}
+	s.installLocked(w, tmp, snapshot)
 }
 
 // checkpointLocked rewrites the live state into a new log and atomically
-// replaces the old one.
+// replaces the old one. Open uses it before anything else runs.
 func (s *Spool) checkpointLocked() {
 	if s.err != nil {
 		return
 	}
 	tmp := logPath(s.cfg.Directory) + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o640)
+	w, err := writeSnapshot(tmp, s.snapshotLocked())
 	if err != nil {
-		s.fail(fmt.Errorf("create checkpoint: %w", err))
+		s.fail(fmt.Errorf("write checkpoint: %w", err))
 		return
 	}
-	w := newLogWriter(f, 0)
-	recs := s.sortedRecordsLocked()
-	err = w.append(&frame{kind: frameHeader, seq: s.nextSeq})
-	for _, r := range recs {
-		if err == nil {
-			err = w.append(&frame{kind: frameRecord, seq: r.seq, seg: r.seg.id, off: r.off, length: r.length, arrival: r.arrival, assocs: r.assocs})
-		}
-	}
-	for _, r := range recs {
-		for i, st := range r.state {
-			if err == nil && (st == kept || st == dropped) {
-				err = w.append(&frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: st == kept})
-			}
-		}
-	}
-	if err == nil {
-		err = w.append(&frame{kind: frameWatermark, seq: s.wm})
-	}
-	for _, e := range s.memo.entries() {
-		if err == nil {
-			err = w.append(&frame{kind: frameMemo, id: e.ID, keep: e.Keep})
-		}
-	}
-	if err == nil {
-		err = w.flush()
-	}
-	if err == nil {
-		err = os.Rename(tmp, logPath(s.cfg.Directory))
-	}
-	if err != nil {
-		f.Close()
+	s.installLocked(w, tmp, w.size)
+}
+
+func (s *Spool) installLocked(w *logWriter, tmp string, snapshot int64) {
+	if err := os.Rename(tmp, logPath(s.cfg.Directory)); err != nil {
+		w.f.Close()
 		s.fail(fmt.Errorf("write checkpoint: %w", err))
 		return
 	}
@@ -418,5 +459,50 @@ func (s *Spool) checkpointLocked() {
 		s.log.f.Close()
 	}
 	s.log = w
+	s.lastSnapshot = snapshot
 	s.stats.Checkpoints++
+}
+
+// snapshotLocked returns the frames that rebuild the live state.
+func (s *Spool) snapshotLocked() []frame {
+	recs := s.sortedRecordsLocked()
+	memo := s.memo.entries()
+	frames := make([]frame, 0, 2+2*len(recs)+len(memo))
+	frames = append(frames, frame{kind: frameHeader, seq: s.nextSeq})
+	for _, r := range recs {
+		frames = append(frames, frame{kind: frameRecord, seq: r.seq, seg: r.seg.id, off: r.off, length: r.length, arrival: r.arrival, assocs: r.assocs})
+	}
+	for _, r := range recs {
+		for i, st := range r.state {
+			if st == kept || st == dropped {
+				frames = append(frames, frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: st == kept})
+			}
+		}
+	}
+	frames = append(frames, frame{kind: frameWatermark, seq: s.wm})
+	for _, e := range memo {
+		frames = append(frames, frame{kind: frameMemo, id: e.ID, keep: e.Keep})
+	}
+	return frames
+}
+
+func writeSnapshot(path string, frames []frame) (*logWriter, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o640)
+	if err != nil {
+		return nil, err
+	}
+	w := newLogWriter(f, 0)
+	for i := range frames {
+		if err = w.append(&frames[i]); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		err = w.flush()
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return w, nil
 }

@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/collector/processor/processortest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
 )
 
 // withManualTicks makes ingestion synchronous and ticks explicit while
@@ -139,6 +140,17 @@ func genSteps(r *rand.Rand, numTraces, numSteps int) [][]ptrace.Traces {
 	return steps
 }
 
+func spoolOf(p processor.Traces) *spool.Spool {
+	return p.(*shardedProcessor).shards[0].spool
+}
+
+// waitSpoolTaken waits until the loop has taken every registered record. A
+// tick requested afterwards runs once the last one is processed.
+func waitSpoolTaken(t *testing.T, p processor.Traces) {
+	sp := spoolOf(p)
+	require.Eventually(t, func() bool { return sp.Stats().UnprocessedRecords == 0 }, 10*time.Second, 100*time.Microsecond)
+}
+
 func newDiffProcessor(t *testing.T, cfg Config, next consumer.Traces) (processor.Traces, *testTSPController) {
 	c := newTestTSPController()
 	cfg.Options = append([]Option{withManualTicks(c)}, cfg.Options...)
@@ -200,6 +212,9 @@ func TestSpoolMatchesInMemoryProcessor(t *testing.T) {
 		pressure bool
 	}{
 		{name: "online", mutate: func(*Config) {}},
+		{name: "read back from disk", mutate: func(c *Config) {
+			c.Spool = &SpoolConfig{MaxUnprocessedMemory: 1}
+		}},
 		{name: "capacity eviction", pressure: true, mutate: func(c *Config) {
 			c.NumTraces = 40
 		}},
@@ -272,13 +287,16 @@ func TestSpoolConfigValidation(t *testing.T) {
 	}
 }
 
-func newAlwaysSampleSpool(t *testing.T, sink *spanCounter) (processor.Traces, *testTSPController) {
+func newAlwaysSampleSpool(t *testing.T, sink *spanCounter, opts ...func(*Config)) (processor.Traces, *testTSPController) {
 	cfg := Config{
 		DecisionWait:     time.Second,
-		NumTraces:        10,
+		NumTraces:        1000,
 		SamplingStrategy: samplingStrategyTraceComplete,
 		PolicyCfgs:       []PolicyCfg{{sharedPolicyCfg: sharedPolicyCfg{Name: "all", Type: AlwaysSample}}},
 		Spool:            &SpoolConfig{Directory: t.TempDir()},
+	}
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 	return newDiffProcessor(t, cfg, sink)
 }
@@ -302,6 +320,7 @@ func TestSpoolDeliversDataModifiedUpstream(t *testing.T) {
 	})
 
 	require.NoError(t, p.ConsumeTraces(context.Background(), td))
+	waitSpoolTaken(t, p)
 	for range 2 {
 		c.waitForTick()
 	}
@@ -323,7 +342,7 @@ func TestSpoolRejectsExpiredRequest(t *testing.T) {
 	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	require.ErrorIs(t, p.ConsumeTraces(expired, td), context.DeadlineExceeded)
-	require.Zero(t, p.(*shardedProcessor).shards[0].spool.Stats().Registered)
+	require.Zero(t, spoolOf(p).Stats().Registered)
 }
 
 func runSpoolDiff(t *testing.T, cfg Config, seed uint64, restart, exact bool) {
@@ -331,11 +350,18 @@ func runSpoolDiff(t *testing.T, cfg Config, seed uint64, restart, exact bool) {
 	steps := genSteps(r, 300, 12)
 	numBatches := int(cfg.DecisionWait.Seconds())
 
+	// cfg.Spool only carries options for the spooled side.
+	spoolCfg := cfg
+	spoolCfg.Spool = &SpoolConfig{}
+	if cfg.Spool != nil {
+		*spoolCfg.Spool = *cfg.Spool
+	}
+	spoolCfg.Spool.Directory, spoolCfg.Spool.SegmentSize, spoolCfg.Spool.CheckpointSize = t.TempDir(), 16<<10, 32<<10
+	cfg.Spool = nil
+
 	wantSink := newSpanCounter()
 	official, oc := newDiffProcessor(t, cfg, wantSink)
 
-	spoolCfg := cfg
-	spoolCfg.Spool = &SpoolConfig{Directory: t.TempDir(), SegmentSize: 16 << 10, CheckpointSize: 32 << 10}
 	gotSink := newSpanCounter()
 	spooled, sc := newDiffProcessor(t, spoolCfg, gotSink)
 
@@ -346,6 +372,7 @@ func runSpoolDiff(t *testing.T, cfg Config, seed uint64, restart, exact bool) {
 			require.NoError(t, official.ConsumeTraces(context.Background(), cp))
 			require.NoError(t, spooled.ConsumeTraces(context.Background(), td))
 		}
+		waitSpoolTaken(t, spooled)
 		oc.waitForTick()
 		sc.waitForTick()
 		if restart && i == len(steps)/2 {

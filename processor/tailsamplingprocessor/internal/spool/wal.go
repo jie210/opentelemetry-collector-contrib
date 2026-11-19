@@ -174,6 +174,8 @@ type logWriter struct {
 	w    *bufio.Writer
 	size int64
 	buf  []byte
+	// tail, when not nil, receives a copy of every appended frame.
+	tail []byte
 }
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -187,9 +189,22 @@ func (l *logWriter) append(fr *frame) error {
 	payload := l.buf[8:]
 	binary.LittleEndian.PutUint32(l.buf[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(l.buf[4:8], crc32.Checksum(payload, castagnoli))
+	if l.tail != nil {
+		l.tail = append(l.tail, l.buf...)
+	}
 	n, err := l.w.Write(l.buf)
 	l.size += int64(n)
 	return err
+}
+
+// appendEncoded appends frames encoded by append and flushes them.
+func (l *logWriter) appendEncoded(b []byte) error {
+	n, err := l.w.Write(b)
+	l.size += int64(n)
+	if err != nil {
+		return err
+	}
+	return l.w.Flush()
 }
 
 func (l *logWriter) flush() error { return l.w.Flush() }

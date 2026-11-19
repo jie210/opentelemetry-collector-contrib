@@ -46,6 +46,7 @@ func (s *Spool) Stop() error {
 	s.readyCond.Broadcast()
 	s.mu.Unlock()
 	s.workers.Wait()
+	s.background.Wait()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

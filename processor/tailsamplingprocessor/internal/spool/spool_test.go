@@ -101,6 +101,7 @@ func crash(s *Spool) {
 	s.readyCond.Broadcast()
 	s.mu.Unlock()
 	s.workers.Wait()
+	s.background.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.log.f.Close()
@@ -169,7 +170,7 @@ func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
 			var u ptrace.ProtoMarshaler
 			raw, err := u.MarshalTraces(td)
 			require.NoError(t, err)
-			rec, err := s.Register(raw, ids, time.Now())
+			rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 			require.NoError(t, err)
 			for _, rs := range td.ResourceSpans().All() {
 				for _, span := range rs.ScopeSpans().At(0).Spans().All() {
@@ -283,7 +284,7 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 			var u ptrace.ProtoMarshaler
 			raw, err := u.MarshalTraces(td)
 			require.NoError(t, err)
-			rec, err := s.Register(raw, ids, time.Now())
+			rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 			require.NoError(t, err)
 			process(rec, allAssocs(rec))
 			if r.IntN(3) == 0 {
@@ -342,31 +343,37 @@ func TestOpenLocksDirectory(t *testing.T) {
 }
 
 func TestSpoolRemovesSegmentsAfterCommit(t *testing.T) {
-	dir := t.TempDir()
-	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
-	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
-	require.NoError(t, err)
-	s.Start()
-	r := rand.New(rand.NewPCG(1, 2))
-	traces := []pcommon.TraceID{{2}, {3}}
-	var next uint64
-	for range 200 {
-		td, ids := makeRequest(r, traces, &next)
-		var u ptrace.ProtoMarshaler
-		raw, err := u.MarshalTraces(td)
+	for _, syncOnRotate := range []bool{false, true} {
+		dir := t.TempDir()
+		sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+		cfg := testConfig(dir)
+		cfg.SyncOnRotate = syncOnRotate
+		s, _, err := Open(cfg, zap.NewNop(), sink)
 		require.NoError(t, err)
-		rec, err := s.Register(raw, ids, time.Now())
-		require.NoError(t, err)
-		s.Begin(rec)
-		for i, a := range ids {
-			s.Inherit(rec, i, keepTrace(a.ID))
+		s.Start()
+		r := rand.New(rand.NewPCG(1, 2))
+		traces := []pcommon.TraceID{{2}, {3}}
+		var next uint64
+		for range 200 {
+			td, ids := makeRequest(r, traces, &next)
+			var u ptrace.ProtoMarshaler
+			raw, err := u.MarshalTraces(td)
+			require.NoError(t, err)
+			rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
+			require.NoError(t, err)
+			s.Begin(rec)
+			for i, a := range ids {
+				s.Inherit(rec, i, keepTrace(a.ID))
+			}
 		}
+		// Sealed segments are removed once their sync is done.
+		require.Eventually(t, func() bool {
+			st := s.Stats()
+			return st.LiveRecords == 0 && st.LiveSegments == 1
+		}, 5*time.Second, 5*time.Millisecond, "only the active segment remains")
+		require.Positive(t, s.Stats().Checkpoints)
+		require.NoError(t, s.Stop())
 	}
-	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, 5*time.Millisecond)
-	st := s.Stats()
-	require.Equal(t, 1, st.LiveSegments, "only the active segment remains")
-	require.Positive(t, st.Checkpoints)
-	require.NoError(t, s.Stop())
 }
 
 func TestSpoolIgnoresTornTail(t *testing.T) {
@@ -382,7 +389,7 @@ func TestSpoolIgnoresTornTail(t *testing.T) {
 	var u ptrace.ProtoMarshaler
 	raw, err := u.MarshalTraces(td)
 	require.NoError(t, err)
-	rec, err := s.Register(raw, ids, time.Now())
+	rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 	require.NoError(t, err)
 	s.Begin(rec)
 	s.Attach(rec, 0)

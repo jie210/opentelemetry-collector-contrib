@@ -51,6 +51,12 @@ func (tsp *tailSamplingSpanProcessor) startSpool() (*spool.Recovered, error) {
 		MaxInflightBytes:   cfg.MaxInflightBytes,
 		KeepMemo:           memoSize(tsp.cfg.DecisionCache.SampledCacheSize),
 		DropMemo:           memoSize(tsp.cfg.DecisionCache.NonSampledCacheSize),
+
+		MaxUnprocessedMemory:  cfg.MaxUnprocessedMemory,
+		MaxUnprocessedRecords: cfg.MaxUnprocessedRecords,
+		MaxUnprocessedBytes:   cfg.MaxUnprocessedBytes,
+		MinFreeDisk:           cfg.MinFreeDisk,
+		MinDeadlineRemaining:  cfg.MinDeadlineRemaining,
 	}, tsp.logger, tsp.nextConsumer)
 	if err != nil {
 		return nil, err
@@ -64,11 +70,10 @@ func (tsp *tailSamplingSpanProcessor) startSpool() (*spool.Recovered, error) {
 	return recovered, nil
 }
 
-// consumeSpooled registers the request and queues its trace fragments. The
-// request is acknowledged once it is registered.
+// consumeSpooled registers the request, which is acknowledged once it is
+// written; the loop processes it later. A request the client already gave
+// up on is refused, as a retry would register it twice.
 func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptrace.Traces) error {
-	// A request the client already gave up on would be registered twice
-	// when the load balancer retries it.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -88,30 +93,67 @@ func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptr
 			batches = append(batches, b)
 		}
 	}
-
-	// Records must reach the loop in sequence order.
-	tsp.ingestMu.Lock()
-	defer tsp.ingestMu.Unlock()
-	rec, err := tsp.spool.Register(data, assocs, time.Now())
-	if err != nil {
-		return err
-	}
-	if len(batches) == 0 {
-		return nil
-	}
-	for i := range batches {
-		batches[i].rec = rec
-	}
-	tsp.workChan <- batches
-	return nil
+	_, err = tsp.spool.Register(ctx, data, assocs, time.Now(), batches)
+	return err
 }
 
-// processSpooledRecord handles the fragments of one registered request.
-func (tsp *tailSamplingSpanProcessor) processSpooledRecord(batch []traceBatch, tickChan <-chan time.Time, arrival time.Time) {
-	rec := batch[0].rec
+// processNextSpooled processes the oldest registered record not processed
+// yet, reading it back if its fragments were not kept in memory.
+func (tsp *tailSamplingSpanProcessor) processNextSpooled(tickChan <-chan time.Time) {
+	if time.Now().Before(tsp.spoolRetryAt) {
+		return
+	}
+	rec, payload, ok := tsp.spool.Next()
+	if !ok {
+		return
+	}
+	batch, _ := payload.([]traceBatch)
+	if batch == nil {
+		td, err := tsp.spool.ReadUnprocessed(rec)
+		if err != nil {
+			// Skipping the record would move the watermark past its
+			// fragments, so later records wait for it.
+			tsp.spoolRetryDelay = min(max(2*tsp.spoolRetryDelay, 100*time.Millisecond), 30*time.Second)
+			tsp.spoolRetryAt = time.Now().Add(tsp.spoolRetryDelay)
+			time.AfterFunc(tsp.spoolRetryDelay, tsp.spool.Poke)
+			tsp.logger.Warn("Failed to read tail spool record, retrying",
+				zap.Uint64("seq", rec.Seq()), zap.Duration("delay", tsp.spoolRetryDelay), zap.Error(err))
+			return
+		}
+		tsp.spoolRetryDelay = 0
+		open := make(map[spool.Assoc]int, len(rec.Assocs()))
+		for i, a := range rec.Assocs() {
+			open[a] = i
+		}
+		batch = spooledFragments(td, open)
+	}
+	tsp.processSpooledRecord(rec, batch, tickChan)
+}
+
+// spooledFragments splits a stored request into the fragments of the open
+// associations, indexed by association.
+func spooledFragments(td ptrace.Traces, open map[spool.Assoc]int) []traceBatch {
+	var batch []traceBatch
+	for ri, rss := range td.ResourceSpans().All() {
+		for _, b := range splitResourceSpansByTrace(rss) {
+			idx, ok := open[spool.Assoc{ID: b.id, Resource: uint32(ri)}]
+			if !ok {
+				continue
+			}
+			b.idx = idx
+			batch = append(batch, b)
+		}
+	}
+	return batch
+}
+
+// processSpooledRecord handles the fragments of one registered request. Its
+// traces arrived when it was registered, however long it waited since.
+func (tsp *tailSamplingSpanProcessor) processSpooledRecord(rec *spool.Record, batch []traceBatch, tickChan <-chan time.Time) {
 	tsp.spool.Begin(rec)
 	for _, b := range batch {
-		tsp.processSpooledFragment(b, tickChan, arrival)
+		b.rec = rec
+		tsp.processSpooledFragment(b, tickChan, rec.Arrival())
 	}
 	tsp.spool.End(rec)
 }
@@ -134,9 +176,9 @@ func (tsp *tailSamplingSpanProcessor) processSpooledFragment(b traceBatch, tickC
 }
 
 // processSpooledTrace mirrors processTrace, folding the fragment into the
-// trace's state instead of storing its spans. A zero arrival means now; a
-// restored fragment passes its original arrival so its decision keeps the
-// original deadline.
+// trace's state instead of storing its spans. A new trace arrived when its
+// record was registered, so a decision keeps its deadline however long the
+// record waited, including across a restart.
 func (tsp *tailSamplingSpanProcessor) processSpooledTrace(b traceBatch, arrival time.Time) {
 	id := b.id
 	var newTraceIDs int64
@@ -147,7 +189,7 @@ func (tsp *tailSamplingSpanProcessor) processSpooledTrace(b traceBatch, arrival 
 	actualData, ok := tsp.idToTrace[id]
 	if !ok {
 		now := time.Now()
-		if arrival.IsZero() || arrival.After(now) {
+		if arrival.After(now) {
 			arrival = now
 		}
 		actualData = &TraceData{
@@ -258,22 +300,12 @@ func (tsp *tailSamplingSpanProcessor) restoreSpool(recovered *spool.Recovered, t
 		for _, idx := range rr.Assocs {
 			open[rr.Record.Assocs()[idx]] = idx
 		}
-		var batch []traceBatch
-		for ri, rss := range td.ResourceSpans().All() {
-			for _, b := range splitResourceSpansByTrace(rss) {
-				idx, ok := open[spool.Assoc{ID: b.id, Resource: uint32(ri)}]
-				if !ok {
-					continue
-				}
-				b.rec, b.idx = rr.Record, idx
-				batch = append(batch, b)
-			}
-		}
+		batch := spooledFragments(td, open)
 		if len(batch) == 0 {
 			continue
 		}
 		fragments += len(batch)
-		tsp.processSpooledRecord(batch, tickChan, rr.Record.Arrival())
+		tsp.processSpooledRecord(rr.Record, batch, tickChan)
 	}
 	tsp.spool.Flush()
 	tsp.logger.Info("Tail spool restored",

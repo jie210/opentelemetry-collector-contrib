@@ -4,6 +4,7 @@
 package spool
 
 import (
+	"context"
 	"errors"
 	"math/rand/v2"
 	"os"
@@ -47,7 +48,7 @@ func registerKept(t *testing.T, s *Spool, count int) (spans int) {
 		var u ptrace.ProtoMarshaler
 		raw, err := u.MarshalTraces(td)
 		require.NoError(t, err)
-		rec, err := s.Register(raw, ids, time.Now())
+		rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 		require.NoError(t, err)
 		s.Begin(rec)
 		for j := range ids {
@@ -142,7 +143,7 @@ func TestReadRecoveredReleasesUnreadableRecord(t *testing.T) {
 		var u ptrace.ProtoMarshaler
 		raw, err := u.MarshalTraces(td)
 		require.NoError(t, err)
-		rec, err := s.Register(raw, ids, time.Now())
+		rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 		require.NoError(t, err)
 		s.Begin(rec)
 		s.Attach(rec, 0)
@@ -188,7 +189,7 @@ func TestOpenReleasesRecordsOfDamagedSegments(t *testing.T) {
 		var u ptrace.ProtoMarshaler
 		raw, err := u.MarshalTraces(td)
 		require.NoError(t, err)
-		rec, err := s.Register(raw, ids, time.Now())
+		rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 		require.NoError(t, err)
 		segOf[rec.Seq()] = rec.seg.id
 		s.Begin(rec)

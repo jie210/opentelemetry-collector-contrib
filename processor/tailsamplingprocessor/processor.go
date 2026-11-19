@@ -12,7 +12,6 @@ import (
 	"math"
 	"runtime"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -119,8 +118,9 @@ type tailSamplingSpanProcessor struct {
 	spool     *spool.Spool
 	foldPlan  *sampling.FoldPlan
 	recovered *spool.Recovered
-	// ingestMu keeps registered requests in sequence order on workChan.
-	ingestMu sync.Mutex
+	// spoolRetryAt postpones the next record after it failed to read back.
+	spoolRetryAt    time.Time
+	spoolRetryDelay time.Duration
 }
 
 func newTracesProcessor(ctx context.Context, set processor.Settings, nextConsumer consumer.Traces, cfg Config) (processor.Traces, error) {
@@ -550,6 +550,12 @@ func (tsp *tailSamplingSpanProcessor) loop() {
 }
 
 func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <-chan []traceBatch) bool {
+	// Spooled requests are registered without going through workChan, which
+	// only signals the shutdown.
+	var spoolWake <-chan struct{}
+	if tsp.spool != nil && workChan != nil {
+		spoolWake = tsp.spool.Wake()
+	}
 	select {
 	case <-tsp.ctx.Done():
 		// If the context is done then we can't send anything anymore so just exit.
@@ -593,11 +599,6 @@ func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <
 		default:
 		}
 
-		if tsp.spool != nil {
-			tsp.processSpooledRecord(batch, tickChan, time.Time{})
-			return true
-		}
-
 		for _, trace := range batch {
 			// Short circuit if the trace has already been sampled or dropped.
 			if tsp.processCachedTrace(trace.id, trace.rss, trace.spanCount) {
@@ -611,6 +612,9 @@ func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <
 
 			tsp.processTrace(trace.id, trace.rss, trace.spanCount, trace.hasRoot)
 		}
+	case <-spoolWake:
+		// Runtime configuration updates are refused with a spool.
+		tsp.processNextSpooled(tickChan)
 	case cmd := <-tsp.newPolicyChan:
 		tsp.policies = cmd.policies
 		tsp.logger.Debug("New policies loaded", zap.Int("policies.len", len(tsp.policies)))
