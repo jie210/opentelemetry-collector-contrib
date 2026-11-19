@@ -174,6 +174,175 @@ func TestReadRecoveredReleasesUnreadableRecord(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
+// deepRequest returns a single-span request whose attributes nest deeper
+// than the protobuf decoder accepts, although it marshals fine.
+func deepRequest(t *testing.T, id pcommon.TraceID) ([]byte, []Assoc) {
+	td := ptrace.NewTraces()
+	span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.SetTraceID(id)
+	span.SetSpanID(pcommon.SpanID{id[0]})
+	m := span.Attributes().PutEmptyMap("k")
+	for range 40 {
+		m = m.PutEmptyMap("k")
+	}
+	var u ptrace.ProtoMarshaler
+	raw, err := u.MarshalTraces(td)
+	require.NoError(t, err)
+	return raw, []Assoc{{ID: id}}
+}
+
+func TestUndecodableRecordIsReleasedAtDelivery(t *testing.T) {
+	dir := t.TempDir()
+	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	s.Start()
+	id := pcommon.TraceID{1}
+	raw, ids := deepRequest(t, id)
+	rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
+	require.NoError(t, err)
+	s.Begin(rec)
+	s.Attach(rec, 0)
+	s.End(rec)
+	s.Decide(id, true)
+	spans := registerKept(t, s, 1)
+
+	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, time.Millisecond)
+	st := s.Stats()
+	require.Equal(t, uint64(1), st.ReadFailures, "not retried")
+	require.Equal(t, uint64(1), st.ReleasedUnreadable)
+	require.Equal(t, spans, sinkSpans(sink))
+	require.NoError(t, s.Stop())
+
+	s, got, err := Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	require.Empty(t, got.Refeed)
+	require.Zero(t, s.Stats().LiveRecords)
+	require.NoError(t, s.Stop())
+}
+
+func TestReadRecoveredReleasesUndecodableRecordAtOnce(t *testing.T) {
+	dir := t.TempDir()
+	sink := &spanSink{spans: map[pcommon.SpanID]int{}}
+	s, _, err := Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	raw, ids := deepRequest(t, pcommon.TraceID{1})
+	r := rand.New(rand.NewPCG(11, 12))
+	var next uint64
+	td, okIDs := makeRequest(r, []pcommon.TraceID{{2}}, &next)
+	var u ptrace.ProtoMarshaler
+	okRaw, err := u.MarshalTraces(td)
+	require.NoError(t, err)
+	for _, req := range []struct {
+		raw []byte
+		ids []Assoc
+	}{{raw, ids}, {okRaw, okIDs}} {
+		rec, err := s.Register(context.Background(), req.raw, req.ids, time.Now(), nil)
+		require.NoError(t, err)
+		s.Begin(rec)
+		s.Attach(rec, 0)
+		s.End(rec)
+	}
+	s.Flush()
+	crash(s)
+
+	s, got, err := Open(testConfig(dir), zap.NewNop(), sink)
+	require.NoError(t, err)
+	require.Len(t, got.Refeed, 2)
+	_, err = s.ReadRecovered(got.Refeed[0].Record)
+	require.ErrorIs(t, err, errUndecodable)
+	require.Equal(t, uint64(1), s.Stats().ReadFailures, "not retried")
+	require.Equal(t, uint64(1), s.Stats().ReleasedUnreadable)
+	// The segment is fine, so its other record is read normally.
+	got1, err := s.ReadRecovered(got.Refeed[1].Record)
+	require.NoError(t, err)
+	require.Equal(t, td.SpanCount(), got1.SpanCount())
+	require.NoError(t, s.Stop())
+}
+
+func TestReadUnprocessedReleasesUndecodableHead(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	cfg.MaxUnprocessedMemory = 1
+	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	raw, ids := deepRequest(t, pcommon.TraceID{1})
+	bad, err := s.Register(context.Background(), raw, ids, time.Now(), "payload")
+	require.NoError(t, err)
+	r := rand.New(rand.NewPCG(13, 14))
+	var next uint64
+	good := newTestRequest(t, r, &next, pcommon.TraceID{2})
+	goodRec, err := good.register(s, context.Background(), "payload")
+	require.NoError(t, err)
+
+	got, _, ok := s.Next()
+	require.True(t, ok)
+	require.Same(t, bad, got)
+	<-s.Wake()
+	_, released, err := s.ReadUnprocessed(bad)
+	require.ErrorIs(t, err, errUndecodable)
+	require.True(t, released, "released on the first attempt")
+	require.Len(t, s.Wake(), 1, "the next record is announced")
+
+	got, _, ok = s.Next()
+	require.True(t, ok)
+	require.Same(t, goodRec, got)
+	td, released, err := s.ReadUnprocessed(goodRec)
+	require.NoError(t, err)
+	require.False(t, released)
+	require.Equal(t, good.spans, td.SpanCount())
+	s.Begin(goodRec)
+	s.Attach(goodRec, 0)
+	s.End(goodRec)
+	s.Flush()
+	st := s.Stats()
+	require.Equal(t, uint64(1), st.ReleasedUnreadable)
+	require.Zero(t, st.UnprocessedRecords)
+	require.Zero(t, st.UnprocessedBytes)
+	crash(s)
+
+	// Only the readable record is processed again after a restart.
+	s, rec, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	require.Len(t, rec.Refeed, 1)
+	require.Equal(t, goodRec.Seq(), rec.Refeed[0].Record.Seq())
+	require.NoError(t, s.Stop())
+}
+
+func TestReadUnprocessedReleasesHeadAfterAttempts(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.MaxUnprocessedMemory = 1
+	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	r := rand.New(rand.NewPCG(15, 16))
+	var next uint64
+	first := newTestRequest(t, r, &next, pcommon.TraceID{1})
+	second := newTestRequest(t, r, &next, pcommon.TraceID{2})
+	firstRec, err := first.register(s, context.Background(), "payload")
+	require.NoError(t, err)
+	secondRec, err := second.register(s, context.Background(), "payload")
+	require.NoError(t, err)
+	failingReads(s, unprocessedReadAttempts)
+
+	for attempt := 1; attempt < unprocessedReadAttempts; attempt++ {
+		_, released, err := s.ReadUnprocessed(firstRec)
+		require.ErrorIs(t, err, errInjected)
+		require.False(t, released, "attempt %d", attempt)
+	}
+	_, released, err := s.ReadUnprocessed(firstRec)
+	require.ErrorIs(t, err, errInjected)
+	require.True(t, released)
+
+	got, _, ok := s.Next()
+	require.True(t, ok)
+	require.Same(t, secondRec, got)
+	_, released, err = s.ReadUnprocessed(secondRec)
+	require.NoError(t, err)
+	require.False(t, released)
+	require.Equal(t, uint64(1), s.Stats().ReleasedUnreadable)
+	require.NoError(t, s.Stop())
+}
+
 func TestOpenReleasesRecordsOfDamagedSegments(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)

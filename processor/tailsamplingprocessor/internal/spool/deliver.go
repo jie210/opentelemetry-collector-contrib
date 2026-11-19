@@ -5,6 +5,7 @@ package spool // import "github.com/open-telemetry/opentelemetry-collector-contr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,9 +13,19 @@ import (
 	"go.uber.org/zap"
 )
 
-// recoveredReadAttempts bounds reads of a record left by a previous run
-// before it is released as unreadable.
-const recoveredReadAttempts = 3
+const (
+	// recoveredReadAttempts bounds reads of a record left by a previous run
+	// before it is released as unreadable.
+	recoveredReadAttempts = 3
+	// unprocessedReadAttempts bounds reads of the oldest unprocessed record,
+	// which holds back every record registered after it.
+	unprocessedReadAttempts = 5
+)
+
+// errUndecodable marks stored bytes that read fine but do not decode, such
+// as a request nested deeper than the protobuf decoder accepts. Reading
+// them again cannot succeed.
+var errUndecodable = errors.New("stored request cannot be decoded")
 
 var (
 	recoveredReadInterval = time.Second
@@ -111,11 +122,16 @@ func (s *Spool) worker() {
 }
 
 // readFailedLocked schedules another delivery attempt of a record that could
-// not be read. Records of this run are retried until the process stops;
+// not be read. A record that does not decode is released at once. Other
+// failures of records of this run are retried until the process stops;
 // records left by a previous run are released after a few attempts.
 func (s *Spool) readFailedLocked(r *Record, err error) {
 	s.stats.ReadFailures++
 	r.readFailures++
+	if errors.Is(err, errUndecodable) {
+		s.releaseUnreadableLocked(r, err)
+		return
+	}
 	if r.recovered && (r.readFailures >= recoveredReadAttempts || r.seg.unreadable) {
 		r.seg.unreadable = true
 		s.releaseUnreadableLocked(r, err)
@@ -143,9 +159,9 @@ func (s *Spool) readFailedLocked(r *Record, err error) {
 	s.retryTimers[t] = struct{}{}
 }
 
-// releaseUnreadableLocked gives up on a record left by a previous run that
-// still cannot be read: its open associations settle as drop and the record
-// is committed so its segment can be reclaimed.
+// releaseUnreadableLocked gives up on a record that cannot be read: its open
+// associations settle as drop and the record is committed so its segment can
+// be reclaimed.
 func (s *Spool) releaseUnreadableLocked(r *Record, err error) {
 	if r.done {
 		return
@@ -216,8 +232,8 @@ func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) (bool, error) {
 }
 
 // ReadRecovered decodes a record left by a previous run so the processor can
-// process its fragments again. A record that cannot be read after a few
-// attempts is released and the error is returned.
+// process its fragments again. A record that does not decode, or cannot be
+// read after a few attempts, is released and the error is returned.
 func (s *Spool) ReadRecovered(r *Record) (ptrace.Traces, error) {
 	for attempt := 1; ; attempt++ {
 		td, err := s.readRecord(r)
@@ -226,6 +242,11 @@ func (s *Spool) ReadRecovered(r *Record) (ptrace.Traces, error) {
 		}
 		s.mu.Lock()
 		s.stats.ReadFailures++
+		if errors.Is(err, errUndecodable) {
+			s.releaseUnreadableLocked(r, err)
+			s.mu.Unlock()
+			return ptrace.Traces{}, err
+		}
 		if attempt >= recoveredReadAttempts || r.seg.unreadable {
 			r.seg.unreadable = true
 			s.releaseUnreadableLocked(r, err)
@@ -250,7 +271,7 @@ func (s *Spool) readRecord(r *Record) (ptrace.Traces, error) {
 	var u ptrace.ProtoUnmarshaler
 	td, err := u.UnmarshalTraces(buf)
 	if err != nil {
-		return ptrace.Traces{}, fmt.Errorf("decode record %d: %w", r.seq, err)
+		return ptrace.Traces{}, fmt.Errorf("record %d: %w: %w", r.seq, errUndecodable, err)
 	}
 	return td, nil
 }

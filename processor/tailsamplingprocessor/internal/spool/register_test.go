@@ -168,8 +168,9 @@ func TestUnprocessedQueue(t *testing.T) {
 	require.True(t, ok)
 	require.Same(t, rb, got)
 	require.Nil(t, payload, "over the memory budget")
-	td, err := s.ReadUnprocessed(rb)
+	td, released, err := s.ReadUnprocessed(rb)
 	require.NoError(t, err)
+	require.False(t, released)
 	require.Equal(t, b.spans, td.SpanCount())
 	s.Begin(rb)
 

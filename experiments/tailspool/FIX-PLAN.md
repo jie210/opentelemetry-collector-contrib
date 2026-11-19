@@ -86,6 +86,8 @@ spool 写盘的是 tailspool receiver 收到的原始请求字节，求值用的
 
 原则：**运行期间读失败从不丢数据；重启后再试一次，仍读不出的坏记录才释放。** 可靠性范围只承诺进程 kill，kill 不会损坏已写入内核的数据，读失败只可能来自磁盘或文件系统故障、外部改动文件，因此不加原文 CRC、不升级 WAL 版本，也不引入长期隔离状态。
 
+> 修订：“读失败只可能来自磁盘或外部改动”不成立，嵌套过深的请求能编码却不能解码，见文末“坏记录从哪里来”。解码错误现在三处都立即释放，待处理队首的 I/O 错误重试 5 次后释放；交付环节的 I/O 错误仍按本节处理。
+
 1. **运行期间读失败不提交。** `deliver` 改为返回 `(done bool, err error)`。回读或解码失败时不写 C、不释放段引用，记录进入延迟重试队列（指数退避，上限 30 秒），不阻塞其他记录，`MaxInflightBytes` 预算在等待期间释放。本次运行内一直重试，不区分错误类型。
 2. **重启后再试一次，仍失败就释放。** 上次运行留下的记录带“已跨重启”标记：
    - 待交付记录：交付 worker 回读失败时做有限次重试（3 次，间隔 1 秒，跨过短暂故障），仍失败则写 C、释放段引用。
@@ -154,3 +156,100 @@ spool 写盘的是 tailspool receiver 收到的原始请求字节，求值用的
 - 1 秒超时下，修复前恢复期间 ACK 停顿，客户端超时 128 次，已登记的请求被重发，16 条记录重复、部分 span 送出 4 份；修复后恢复期间照常 ACK（全程最大 90 ms），没有超时，也没有重复。失败只发生在进程重启、端口未监听的窗口内。
 - 修复后恢复期间新请求先落盘排队，800 req/s 的 kill 用例 spool 盘峰值为 1,914 MB（修复前 1,075 MB），峰值 RSS 820 MB（修复前 612 MB），差额为恢复期间积压的记录与其内存中的拆分结果（受 `max_unprocessed_memory` 约束）。
 - 慢 sink 的 7 次 kill 共重复 48 条记录，与第三章相同，在每次 kill 不超过 `max_inflight_records`=16 的上限之内。
+
+## 已确认问题：待处理队首读失败可导致其他 trace 漏采样
+
+**状态：** 已在 Linux 测试机 `10.98.1.5` 上对提交 `9b5b8ca1be5d` 复现。涉及 spool 模式下尚未折叠的请求，故障发生在采样决定之前的回读路径。现有的交付读失败重试发生在采样决定之后，无法补救此处的错误决定。修复方案第 1、2 项已实施，见本节末“实施与复测”。
+
+**预期：** 只配置 `status_code: ERROR`，没有容量淘汰或大小限制时，在决策窗口内成功接收的 ERROR 片段应参与同一 trace 的求值。一旦命中，普通 span 和 ERROR span 都应被保留。普通 span 进入待决状态后，trace 继续保持 `Pending`，直到到期 tick 发布决定。
+
+### 真实时钟复现
+
+使用默认一秒 ticker、`decision_wait: 3s` 和 `max_unprocessed_memory: 1` 字节，强制待处理记录从磁盘回读。用三条独立请求构造固定顺序，A 的两条 span 有相同的 trace ID 和不同的 span ID。
+
+| 登记顺序 | 输入 | 实际处理 |
+|---|---|---|
+| 1 | Trace A 的普通 span | 写盘后被主循环读取，纳入 A 的待决状态。A 没有发布决定。 |
+| 2 | 无关的 Trace B | 用实际登记路径写入等长的非法 protobuf，制造可恢复的解码故障。B 留在待处理队列首位。 |
+| 3 | Trace A 的 ERROR span | 在普通 span 到达后 6–19 ms 内写入完好的数据，processor 的 `ConsumeTraces` 返回成功。记录排在 B 后面，尚未纳入 A 的待决状态。 |
+| 约 4 秒 | 到期 tick | B 仍在重试，A 的 ERROR span 仍在队列里。A 只用第 1 条记录求值，发布 drop。 |
+| 决定发布后 | 修复 B 的数据 | 用原始的合法字节原位恢复 B。队列成功排空，A 的 ERROR span 继承已发布的 drop，A 的两条 span 均未导出。 |
+
+故障组使用真实 ticker 连续执行 3 次，3 次均复现。对照组只把 B 换成正常可读的记录，3 次均各导出 A 的普通 span 和 ERROR span 一次。早期的手动 tick 探针有同样结果，真实时钟用例确认了这并非由手动推进 tick 造成。测试覆盖 processor 写盘返回、调度和下游捕获，未经过实际 OTLP 网络请求。日志和探针保留在测试机：
+
+- `/data/tailspool-0863799-verify/run-9b5b8ca1/out/queue-wallclock-probe.log`
+- `/data/tailspool-0863799-verify/run-9b5b8ca1/src/processor/tailsamplingprocessor/verification_wallclock_probe_test.go`
+
+### 为什么一条记录会影响其他 trace
+
+待处理队列按 **OTLP 请求记录的登记顺序** 共享，不按 trace ID 隔离。`Register` 在段文件写入并 Flush 登记 WAL 后即可成功返回，记录稍后才由主循环读入、拆分并折叠。队首读失败时，`processNextSpooled` 安排退避重试并返回，以免推进已经处理完的记录水位。队首留在原位，之后的记录无法开始处理。到期 tick 仍可独立运行，且只读取当前已折叠状态，没有确认窗口内已成功登记的片段都已处理。最终决定发布后，尚未折叠的片段走决定继承路径。
+
+因此，B 的错误只损坏了 B 的测试记录，但阻塞了后续记录的处理。A 的 ERROR 记录本身可读，且在决策窗口内已经成功登记。A 漏采样是因为 tick 在队列处理完之前发布了终局决定。这个问题已在注入读故障时复现，健康对照没有出现。普通积压、恢复重放和实际磁盘故障下的发生频率尚未验证。
+
+代码入口：[写盘后返回](../../processor/tailsamplingprocessor/spool_mode.go#L73) · [共享队首](../../processor/tailsamplingprocessor/internal/spool/spool.go#L347) · [读失败重试](../../processor/tailsamplingprocessor/spool_mode.go#L100) · [独立 tick](../../processor/tailsamplingprocessor/processor.go#L615) · [决定继承](../../processor/tailsamplingprocessor/spool_mode.go#L241)。
+
+### OTLP 实测复核
+
+测试机上用 `9b5b8ca1be5` 构建的 collector（otlp receiver → tail_sampling spool → otlp exporter），只配 `status_code: ERROR`，`decision_wait: 5s`，`max_unprocessed_memory: 1`，真实 ticker。探针 `bench/cmd/headprobe` 经 OTLP gRPC 依次发送 A 的普通 span、200 个填充请求（主循环积压约 0.4 s）、B、A 的 ERROR span，全部 ACK 后在 B 被读到之前清零段文件里 B 的 49 字节。每组 3 次，每次新目录：
+
+| 组 | A 截止后（+8 s） | 最终 | collector 读失败告警 |
+|---|---|---|---|
+| 对照，B 完好 | 普通 1、ERROR 1 | 同左 | 0 |
+| B 在 +8 s 恢复 | 0、0 | 0、0；恢复后下一次重试读通，队列排空，A 的 ERROR 继承 drop | 7 |
+| B 不恢复，之后再发 50 条无关 ERROR trace | 0、0 | 50 条全部 ACK，10 s 内导出 0 条 | 8 |
+
+### 坏记录从哪里来
+
+本次运行登记的记录读失败只有三类来源：
+
+1. **数据本身读不回来（确定性，可由客户端触发）。** pdata 的 protobuf 解码有递归上限（`RecursionLimit = 100`），编码没有。属性里 map 嵌套到 33 层时，`ProtoMarshaler` 正常编码，`ProtoUnmarshaler` 返回 `exceeded max recursion depth`；JSON 解码到 120 层都正常。OTLP gRPC 和 HTTP protobuf 在 receiver 解码时就拒绝这类请求，OTLP/HTTP JSON 会接受，之后 spool 把它编码写盘，再也读不回来。管道内的处理器或其他 receiver 构造的深嵌套属性同理。测试机实测（`bench/cmd/poisonprobe`，always_sample）：
+   - `max_unprocessed_memory: 1`（相当于有积压）：一条 40 层嵌套的 JSON 请求返回 200，之后 20 条普通请求全部 200，8 s 内导出 0 条，整条管道停住。
+   - 默认 64 MiB：坏记录的载荷在内存里，折叠正常，普通请求 20/20 导出；坏记录本身交付时读不回来，本次运行内一直重试，重启后重试 3 次释放，丢失。官方处理器不写盘，不会在这里失败，只是下游 OTLP 接收端同样会拒绝它。
+2. **I/O 错误。** 段文件刚写入时通常还在页缓存里；积压大、内存紧张时被回收，回读才落到设备，设备或云盘故障会返回 EIO。频率低，无法预防。
+3. **外部改动。** 其他进程或人工截断、改写段文件（文件被删除不影响，已打开的句柄仍可读）。目录锁是 flock，跨主机的网络文件系统上不能防止两个实例共用目录。
+
+代码路径检查过：段文件只在持锁的 `Register` 中追加，偏移取自写入前的大小；排队记录持有段引用，引用归零才删除段；`Stop` 在主循环退出后才关闭文件。没有发现由 spool 自身逻辑写坏或提前删除记录的路径。
+
+### 原版如何处理
+
+- 默认内存存储不序列化，深嵌套 span 正常通过采样，到下一跳 OTLP protobuf 接收端才被拒绝。测试机同一请求：20 条普通请求全部导出，坏 span 导出失败（`Permanent error ... exceeded max recursion depth`），互不影响。
+- Pebble 存储（实验特性）同样用 protobuf 编解码，写入成功、读不回来。`on_read_error` 默认 `drop_trace`，`Take` 返回错误，processor 记 Error 后丢掉这一个 trace；`return_partial` 只返回能读的部分。任何读错误都立即处置，不重试，不影响其他 trace。本地实测：深嵌套 trace 被丢，同库另一个 trace 正常读出。
+
+spool 的问题不在于坏数据丢了，而在于对确定性失败无限重试，并让它挡住后续记录。
+
+### 修复方案
+
+参考 Pebble，读不回来的数据直接丢。丢弃粒度是记录：一条记录是一个请求，只丢其中的片段，相关 trace 在其他记录里的片段照常参与决定，相当于 Pebble 的 `return_partial`。
+
+1. **解码错误立即释放。** 解码失败是确定性的。待处理队首、交付、重启后重放三处读到解码错误时，都立即调用 `releaseUnreadableLocked`：关联全部按 drop 结算并提交，记 Error 日志和 `ReleasedUnreadable`，然后继续处理。待处理队首释放时照常推进水位，WAL 语义不变。
+2. **待处理队首的 I/O 错误短暂重试后释放。** 队首挡着后续全部记录，退避重试数次（共约 1–2 s）仍失败则同样释放。交付环节的 I/O 错误保持现状：本次运行内重试，重启后有限次重试再释放，一条记录卡住不影响其他记录。
+3. **tick 推迟决定：待验证后再定。** 有了 1、2，复现场景中的队首阻塞不再发生。剩下的推论是：积压或重启恢复时 tick 不等待队列，有效决策窗口会缩短约等于积压延迟。先在测试机实测，确认存在再按 trace 推迟决定（登记时按关联计数，tick 时跳过仍有截止前片段在排队的 trace，容量满时的嵌套 tick 不推迟）。
+4. **写盘前检查嵌套深度：可选，暂不做。** 原版同样接受这类请求，丢弃后已不会阻塞，此项只能让丢失对客户端可见。
+
+### 修复验收
+
+- 深嵌套 JSON 请求：积压和默认内存预算下，之后的普通请求全部正常导出；坏记录被释放一次，不反复重试；重启后不再出现。
+- A/B/A 顺序，B 为解码失败：B 立即释放，A 的两条 span 各导出一次。
+- 队首持续 I/O 错误：重试数次后释放，后续无关记录恢复正常采样；验证同机 SIGKILL 前后 WAL 水位不会跳过未结算的关联。
+- 交付时解码失败立即释放并提交；I/O 错误仍按原逻辑重试。
+- 积压与重启恢复下决策窗口是否缩短（第 3 项的前置验证）。
+
+### 实施与复测
+
+已实施方案第 1、2 项，第 3、4 项未做。
+
+- `readRecord` 把解码失败包装为 `errUndecodable`。`readFailedLocked`（交付）和 `ReadRecovered`（重放）遇到它立即释放，不标记整段不可读。
+- `ReadUnprocessed` 改为返回 `(td, released, err)`：解码失败，或累计 5 次读失败（处理器退避 0.1、0.2、0.4、0.8 s，共约 1.5 s），即把记录移出待处理队列、按 drop 结算并提交、推进水位；处理器随即处理下一条。
+- 单测：交付、重放、待处理队首三处的解码失败各释放一次且不重试，重启后不再出现；队首连续 I/O 失败在第 5 次释放；processor 层用 40 层嵌套的请求覆盖回读与内存两种路径，A 的两条 span 各导出一次；段文件被截断的队首约 1.5 s 后释放，之后的请求正常采样。新用例在修复前的实现上均失败。
+
+测试机复测（同一 OTLP 探针，修复后的 collector，每组 3 次）：
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| A/B/A，B 清零（解码失败），+8 s 恢复 | A 两条 span 均未导出，读失败告警 7 | A 普通 1、ERROR 1；B 释放 1 次，无重试 |
+| A/B/A，B 不恢复，之后 50 条无关 ERROR trace | A 未导出，无关 trace 导出 0/50 | A 普通 1、ERROR 1；无关 trace 50/50 |
+| 对照 | A 普通 1、ERROR 1 | 同左 |
+| 40 层嵌套 JSON，回读路径 | 普通请求 0/20，管道停住 | 20/20，坏记录释放 1 次 |
+| 40 层嵌套 JSON，默认内存预算 | 20/20，坏记录交付时反复重试，重启后才释放 | 20/20，交付时释放 1 次，重启后无残留 |
+
+日志在测试机 `/mnt/otelbench/tailspool-fold/probe/{otlp,poison}`（修复前）和 `{otlp-fix,poison-fix}`（修复后）。

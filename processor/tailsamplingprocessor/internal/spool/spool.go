@@ -184,8 +184,8 @@ type Stats struct {
 	DeliveryFailures uint64
 	// ReadFailures counts failed reads of stored requests.
 	ReadFailures uint64
-	// ReleasedUnreadable counts records of a previous run given up on
-	// because they could not be read.
+	// ReleasedUnreadable counts records given up on because they could not
+	// be read.
 	ReleasedUnreadable      uint64
 	ReleasedUnreadableBytes uint64
 	// RejectedExpired and RejectedBackpressure count requests refused before
@@ -357,17 +357,27 @@ func (s *Spool) Next() (*Record, any, bool) {
 	return r, r.payload, true
 }
 
-// ReadUnprocessed decodes a queued record whose payload was not kept.
-func (s *Spool) ReadUnprocessed(r *Record) (ptrace.Traces, error) {
-	td, err := s.readRecord(r)
+// ReadUnprocessed decodes a queued record whose payload was not kept. A
+// record that does not decode, or still cannot be read after a few
+// attempts, is released with its fragments dropped, as it holds back every
+// later record; released reports it, and the queue moves on.
+func (s *Spool) ReadUnprocessed(r *Record) (td ptrace.Traces, released bool, err error) {
+	td, err = s.readRecord(r)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err != nil {
-		s.stats.ReadFailures++
-	} else {
+	if err == nil {
 		s.stats.UnprocessedReads++
+		return td, false, nil
 	}
-	return td, err
+	s.stats.ReadFailures++
+	r.readFailures++
+	if !errors.Is(err, errUndecodable) && r.readFailures < unprocessedReadAttempts {
+		return td, false, err
+	}
+	s.dequeueLocked(r)
+	s.releaseUnreadableLocked(r, err)
+	s.wm = max(s.wm, r.seq)
+	return td, true, err
 }
 
 // Attach adds the record's association i to the trace's pending instance.
@@ -439,17 +449,23 @@ func (s *Spool) Begin(r *Record) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.wm = max(s.wm, r.seq-1)
-	if len(s.unprocessed) > 0 && s.unprocessed[0] == r {
-		s.unprocessed[0] = nil
-		s.unprocessed = s.unprocessed[1:]
-		s.unprocessedBytes -= int64(r.length)
-		if r.payload != nil {
-			r.payload = nil
-			s.unprocessedMemory -= int64(r.length)
-		}
-		if len(s.unprocessed) > 0 {
-			s.pokeLocked()
-		}
+	s.dequeueLocked(r)
+}
+
+// dequeueLocked removes r from the head of the unprocessed queue.
+func (s *Spool) dequeueLocked(r *Record) {
+	if len(s.unprocessed) == 0 || s.unprocessed[0] != r {
+		return
+	}
+	s.unprocessed[0] = nil
+	s.unprocessed = s.unprocessed[1:]
+	s.unprocessedBytes -= int64(r.length)
+	if r.payload != nil {
+		r.payload = nil
+		s.unprocessedMemory -= int64(r.length)
+	}
+	if len(s.unprocessed) > 0 {
+		s.pokeLocked()
 	}
 }
 
