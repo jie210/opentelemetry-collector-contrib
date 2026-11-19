@@ -4,18 +4,16 @@
 package tailsamplingprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor"
 
 import (
-	"container/heap"
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/idbatcher"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/sampling"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/telemetry"
@@ -55,12 +53,12 @@ func (tsp *tailSamplingSpanProcessor) startSpool() (*spool.Recovered, error) {
 		KeepMemo:           memoSize(tsp.cfg.DecisionCache.SampledCacheSize),
 		DropMemo:           memoSize(tsp.cfg.DecisionCache.NonSampledCacheSize),
 
-		MaxUnprocessedMemory:  cfg.MaxUnprocessedMemory,
-		MaxUnprocessedRecords: cfg.MaxUnprocessedRecords,
-		MaxUnprocessedBytes:   cfg.MaxUnprocessedBytes,
-		MinFreeDisk:           cfg.MinFreeDisk,
-		MinDeadlineRemaining:  cfg.MinDeadlineRemaining,
-		ReadRetries:           cfg.ReadRetries,
+		// Like the work channel of the in-memory processor, so the loop
+		// lags the acknowledged requests by as little.
+		MaxUnprocessed:       runtime.NumCPU(),
+		MinFreeDisk:          cfg.MinFreeDisk,
+		MinDeadlineRemaining: cfg.MinDeadlineRemaining,
+		ReadRetries:          cfg.ReadRetries,
 	}, tsp.logger, tsp.nextConsumer)
 	if err != nil {
 		return nil, err
@@ -75,8 +73,9 @@ func (tsp *tailSamplingSpanProcessor) startSpool() (*spool.Recovered, error) {
 }
 
 // consumeSpooled registers the request, which is acknowledged once it is
-// written; the loop processes it later. A request the client already gave
-// up on is refused, as a retry would register it twice.
+// written; the loop processes it later. Registering waits while the loop
+// is behind, and a request the client already gave up on is refused, as a
+// retry would register it twice.
 func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptrace.Traces) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -102,87 +101,13 @@ func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptr
 }
 
 // processNextSpooled processes the oldest registered record not processed
-// yet, reading it back if its fragments were not kept in memory.
+// yet.
 func (tsp *tailSamplingSpanProcessor) processNextSpooled(tickChan <-chan time.Time) {
-	if time.Now().Before(tsp.spoolRetryAt) {
-		return
-	}
 	rec, payload, ok := tsp.spool.Next()
 	if !ok {
 		return
 	}
-	batch, _ := payload.([]traceBatch)
-	if batch == nil {
-		td, released, err := tsp.spool.ReadUnprocessed(rec)
-		if released {
-			tsp.spoolRetryDelay = 0
-			return
-		}
-		if err != nil {
-			// Skipping the record would move the watermark past its
-			// fragments, so later records wait for it until its read
-			// retries run out.
-			tsp.spoolRetryDelay = min(max(2*tsp.spoolRetryDelay, 100*time.Millisecond), 30*time.Second)
-			tsp.spoolRetryAt = time.Now().Add(tsp.spoolRetryDelay)
-			time.AfterFunc(tsp.spoolRetryDelay, tsp.spool.Poke)
-			tsp.logger.Warn("Failed to read tail spool record, retrying",
-				zap.Uint64("seq", rec.Seq()), zap.Duration("delay", tsp.spoolRetryDelay), zap.Error(err))
-			return
-		}
-		tsp.spoolRetryDelay = 0
-		open := make(map[spool.Assoc]int, len(rec.Assocs()))
-		for i, a := range rec.Assocs() {
-			open[a] = i
-		}
-		batch = spooledFragments(td, open)
-	}
-	tsp.processSpooledRecord(rec, batch, tickChan)
-}
-
-// heldTrace is a trace due a decision while fragments of it were queued,
-// last being the sequence number of the last record holding one then.
-type heldTrace struct {
-	id   pcommon.TraceID
-	last uint64
-}
-
-// heldTraces is a min-heap of held traces by the record they wait for.
-type heldTraces []heldTrace
-
-func (h heldTraces) Len() int           { return len(h) }
-func (h heldTraces) Less(i, j int) bool { return h[i].last < h[j].last }
-func (h heldTraces) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *heldTraces) Push(x any)        { *h = append(*h, x.(heldTrace)) }
-
-func (h *heldTraces) Pop() any {
-	old := *h
-	x := old[len(old)-1]
-	*h = old[:len(old)-1]
-	return x
-}
-
-// holdQueuedTraces moves the traces of batch with fragments still queued to
-// the held ones. Fragments registered later do not hold them further.
-func (tsp *tailSamplingSpanProcessor) holdQueuedTraces(batch idbatcher.Batch) {
-	tsp.spool.Queued(batch, func(id pcommon.TraceID, last uint64) {
-		delete(batch, id)
-		heap.Push(&tsp.held, heldTrace{id: id, last: last})
-	})
-}
-
-// decideReleasedTraces decides the held traces whose fragments queued when
-// they were due have all been processed.
-func (tsp *tailSamplingSpanProcessor) decideReleasedTraces() {
-	var batch idbatcher.Batch
-	for tsp.held.Len() > 0 && tsp.spool.Begun(tsp.held[0].last) {
-		if batch == nil {
-			batch = idbatcher.Batch{}
-		}
-		batch[heap.Pop(&tsp.held).(heldTrace).id] = struct{}{}
-	}
-	if batch != nil {
-		tsp.decideBatch(batch)
-	}
+	tsp.processSpooledRecord(rec, payload.([]traceBatch), tickChan)
 }
 
 // spooledFragments splits a stored request into the fragments of the open

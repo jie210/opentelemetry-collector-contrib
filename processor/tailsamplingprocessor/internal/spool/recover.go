@@ -157,10 +157,13 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		memo:    newMemo(cfg.KeepMemo, cfg.DropMemo),
 		nextSeq: 1,
 		wake:    make(chan struct{}, 1),
+		stopped: make(chan struct{}),
 
-		lastQueued:  map[pcommon.TraceID]uint64{},
 		retryTimers: map[*time.Timer]struct{}{},
 		readAt:      readSegment,
+	}
+	if cfg.MaxUnprocessed > 0 {
+		s.room = make(chan struct{}, cfg.MaxUnprocessed)
 	}
 	s.readyCond = sync.NewCond(&s.mu)
 

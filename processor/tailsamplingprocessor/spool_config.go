@@ -29,17 +29,6 @@ type SpoolConfig struct {
 	// MaxInflightBytes bounds the stored bytes of those requests. Defaults to
 	// 64 MiB.
 	MaxInflightBytes int64 `mapstructure:"max_inflight_bytes"`
-	// Requests are acknowledged once written and wait for the processor,
-	// also while it restores pending traces after a restart.
-	// MaxUnprocessedMemory bounds the stored bytes of waiting requests kept
-	// decoded in memory; the others are read back from disk. Defaults to
-	// 64 MiB.
-	MaxUnprocessedMemory int64 `mapstructure:"max_unprocessed_memory"`
-	// MaxUnprocessedRecords and MaxUnprocessedBytes refuse new requests with
-	// a retryable error while that many requests or stored bytes wait. Zero
-	// means no limit.
-	MaxUnprocessedRecords int   `mapstructure:"max_unprocessed_records"`
-	MaxUnprocessedBytes   int64 `mapstructure:"max_unprocessed_bytes"`
 	// MinFreeDisk refuses new requests with a retryable error while the
 	// directory's file system has less free space in bytes. Zero disables
 	// the check.
@@ -50,8 +39,7 @@ type SpoolConfig struct {
 	MinDeadlineRemaining time.Duration `mapstructure:"min_deadline_remaining"`
 	// ReadRetries is how many times a stored request that failed to read
 	// back is read again, with a growing delay, before its spans are
-	// dropped. A waiting request being retried holds back those after it.
-	// Zero drops them at the first failure.
+	// dropped. Zero drops them at the first failure.
 	ReadRetries int `mapstructure:"read_retries"`
 }
 
@@ -68,9 +56,6 @@ func (cfg *SpoolConfig) withDefaults() SpoolConfig {
 	}
 	if out.MaxInflightBytes <= 0 {
 		out.MaxInflightBytes = 64 << 20
-	}
-	if out.MaxUnprocessedMemory <= 0 {
-		out.MaxUnprocessedMemory = 64 << 20
 	}
 	return out
 }

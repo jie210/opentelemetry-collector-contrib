@@ -5,7 +5,6 @@ package tailsamplingprocessor // import "github.com/open-telemetry/opentelemetry
 
 import (
 	"bytes"
-	"container/heap"
 	"container/list"
 	"context"
 	"errors"
@@ -119,11 +118,6 @@ type tailSamplingSpanProcessor struct {
 	spool     *spool.Spool
 	foldPlan  *sampling.FoldPlan
 	recovered *spool.Recovered
-	// spoolRetryAt postpones the next record after it failed to read back.
-	spoolRetryAt    time.Time
-	spoolRetryDelay time.Duration
-	// held are the traces due a decision whose fragments were still queued.
-	held heldTraces
 }
 
 func newTracesProcessor(ctx context.Context, set processor.Settings, nextConsumer consumer.Traces, cfg Config) (processor.Traces, error) {
@@ -618,7 +612,6 @@ func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <
 	case <-spoolWake:
 		// Runtime configuration updates are refused with a spool.
 		tsp.processNextSpooled(tickChan)
-		tsp.decideReleasedTraces()
 	case cmd := <-tsp.newPolicyChan:
 		tsp.policies = cmd.policies
 		tsp.logger.Debug("New policies loaded", zap.Int("policies.len", len(tsp.policies)))
@@ -626,37 +619,12 @@ func (tsp *tailSamplingSpanProcessor) iter(tickChan <-chan time.Time, workChan <
 		tsp.maxTraceSizeBytes = maxTraceSize
 		tsp.logger.Debug("New maximum trace size loaded", zap.Uint64("size", maxTraceSize))
 	case <-tickChan:
-		tsp.tick(workChan != nil)
+		tsp.samplingPolicyOnTick()
 	case tickChan := <-tsp.tickChan:
-		tsp.tick(workChan != nil)
+		tsp.samplingPolicyOnTick()
 		tickChan <- struct{}{}
 	}
 	return true
-}
-
-// tick decides the traces due. With a spool, requests are acknowledged
-// before the loop processes them, so a trace with fragments still queued is
-// held until they are processed, as the in-memory processor holds the client
-// until its fragments are processed. A tick taken while waiting for space
-// holds none and decides those held, as no record is processed until it
-// frees some.
-func (tsp *tailSamplingSpanProcessor) tick(hold bool) {
-	if tsp.spool == nil {
-		tsp.samplingPolicyOnTick()
-		return
-	}
-	batch, _ := tsp.decisionBatcher.CloseCurrentAndTakeFirstBatch()
-	if hold {
-		tsp.holdQueuedTraces(batch)
-	} else {
-		if batch == nil {
-			batch = idbatcher.Batch{}
-		}
-		for tsp.held.Len() > 0 {
-			batch[heap.Pop(&tsp.held).(heldTrace).id] = struct{}{}
-		}
-	}
-	tsp.decideBatch(batch)
 }
 
 // processCachedTrace checks if a given trace has already been sampled (or
@@ -778,18 +746,13 @@ func (tsp *tailSamplingSpanProcessor) runBatchPolicies(ctx context.Context, cand
 
 // samplingPolicyOnTick takes the next batch and process all traces in that batch. Returns if there are more batches in the batcher.
 func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
-	batch, hasMore := tsp.decisionBatcher.CloseCurrentAndTakeFirstBatch()
-	tsp.decideBatch(batch)
-	return hasMore
-}
-
-func (tsp *tailSamplingSpanProcessor) decideBatch(batch idbatcher.Batch) {
 	tsp.logger.Debug("Sampling Policy Evaluation ticked")
 
 	metrics := newPolicyEvaluationMetrics(len(tsp.policies))
 	startTime := time.Now()
 	globalTracesSampledByDecision := make(map[samplingpolicy.Decision]int64)
 
+	batch, hasMore := tsp.decisionBatcher.CloseCurrentAndTakeFirstBatch()
 	batchLen := len(batch)
 	var span trace.Span
 	ctx := context.Background()
@@ -975,6 +938,7 @@ func (tsp *tailSamplingSpanProcessor) decideBatch(batch idbatcher.Batch) {
 		zap.Int64("droppedPriorToEvaluation", metrics.idNotFoundOnMapCount),
 		zap.Int64("policyEvaluationErrors", metrics.evaluateErrorCount),
 	)
+	return hasMore
 }
 
 // makeDecision evaluates tsp.policies[numDropPolicies:], skipping a

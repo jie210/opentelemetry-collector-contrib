@@ -212,9 +212,6 @@ func TestSpoolMatchesInMemoryProcessor(t *testing.T) {
 		pressure bool
 	}{
 		{name: "online", mutate: func(*Config) {}},
-		{name: "read back from disk", mutate: func(c *Config) {
-			c.Spool = &SpoolConfig{MaxUnprocessedMemory: 1}
-		}},
 		{name: "capacity eviction", pressure: true, mutate: func(c *Config) {
 			c.NumTraces = 40
 		}},

@@ -5,7 +5,6 @@ package spool
 
 import (
 	"context"
-	"errors"
 	"math"
 	"math/rand/v2"
 	"runtime"
@@ -83,66 +82,97 @@ func TestRegisterChecksDeadlineWhenWriting(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
-func TestRegisterBackpressure(t *testing.T) {
+func TestRegisterWaitsForRoom(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
-	cfg.MaxUnprocessedRecords = 2
+	cfg.MaxUnprocessed = 2
 	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
 	require.NoError(t, err)
 	r := rand.New(rand.NewPCG(2, 2))
 	var next uint64
 	req := newTestRequest(t, r, &next, pcommon.TraceID{1})
-	setLimits := func(records int, bytes, freeDisk int64) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.cfg.MaxUnprocessedRecords, s.cfg.MaxUnprocessedBytes, s.cfg.MinFreeDisk = records, bytes, freeDisk
-		s.freeDiskChecked = time.Time{}
-	}
 
+	// A record without associations is not queued and takes no room.
+	_, err = s.Register(context.Background(), req.raw, nil, time.Now(), nil)
+	require.NoError(t, err)
 	first, err := req.register(s, context.Background(), nil)
 	require.NoError(t, err)
 	_, err = req.register(s, context.Background(), nil)
 	require.NoError(t, err)
-	_, err = req.register(s, context.Background(), nil)
-	require.ErrorIs(t, err, ErrBackpressure)
-	s.Begin(first)
-	_, err = req.register(s, context.Background(), nil)
-	require.NoError(t, err)
 
-	setLimits(0, 2*int64(len(req.raw)), 0)
-	_, err = req.register(s, context.Background(), nil)
-	require.ErrorIs(t, err, ErrBackpressure)
+	// A request that gives up waiting is not written.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = req.register(s, ctx, nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.EqualValues(t, 3, s.Stats().Registered)
+	require.EqualValues(t, 1, s.Stats().RejectedExpired)
 
-	registered := 3
-	if slices.Contains([]string{"darwin", "freebsd", "linux"}, runtime.GOOS) {
-		setLimits(0, 0, math.MaxInt64)
-		_, err = req.register(s, context.Background(), nil)
-		require.ErrorIs(t, err, ErrBackpressure)
-		setLimits(0, 0, 1)
-		_, err = req.register(s, context.Background(), nil)
-		require.NoError(t, err)
-		registered++
+	// One waits until the processor begins a record.
+	registered := make(chan error, 1)
+	go func() {
+		_, err := req.register(s, context.Background(), nil)
+		registered <- err
+	}()
+	select {
+	case err := <-registered:
+		require.FailNow(t, "registered while the queue was full", "%v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
+	s.Begin(first)
+	require.NoError(t, <-registered)
+	require.Equal(t, 2, s.Stats().UnprocessedRecords)
 
-	st := s.Stats()
-	require.EqualValues(t, registered, st.Registered)
-	require.EqualValues(t, st.Registered-1, st.UnprocessedRecords)
+	// Stopping releases those waiting.
+	go func() {
+		_, err := req.register(s, context.Background(), nil)
+		registered <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
 	require.NoError(t, s.Stop())
+	require.ErrorIs(t, <-registered, errStopped)
 
 	s, got, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
 	require.NoError(t, err)
-	require.Len(t, got.Refeed, registered)
+	require.Len(t, got.Refeed, 3)
+	require.NoError(t, s.Stop())
+}
+
+func TestRegisterChecksFreeDisk(t *testing.T) {
+	if !slices.Contains([]string{"darwin", "freebsd", "linux"}, runtime.GOOS) {
+		t.Skip("free disk space is not checked")
+	}
+	cfg := testConfig(t.TempDir())
+	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	r := rand.New(rand.NewPCG(2, 2))
+	var next uint64
+	req := newTestRequest(t, r, &next, pcommon.TraceID{1})
+	setFreeDisk := func(freeDisk int64) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.cfg.MinFreeDisk = freeDisk
+		s.freeDiskChecked = time.Time{}
+	}
+
+	setFreeDisk(math.MaxInt64)
+	_, err = req.register(s, context.Background(), nil)
+	require.ErrorIs(t, err, ErrBackpressure)
+	setFreeDisk(1)
+	_, err = req.register(s, context.Background(), nil)
+	require.NoError(t, err)
+	st := s.Stats()
+	require.EqualValues(t, 1, st.Registered)
+	require.EqualValues(t, 1, st.RejectedBackpressure)
 	require.NoError(t, s.Stop())
 }
 
 func TestUnprocessedQueue(t *testing.T) {
-	dir := t.TempDir()
-	cfg := testConfig(dir)
+	cfg := testConfig(t.TempDir())
 	r := rand.New(rand.NewPCG(3, 3))
 	var next uint64
 	a := newTestRequest(t, r, &next, pcommon.TraceID{1})
 	b := newTestRequest(t, r, &next, pcommon.TraceID{2})
-	cfg.MaxUnprocessedMemory = int64(len(a.raw))
 	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
 	require.NoError(t, err)
 
@@ -153,7 +183,6 @@ func TestUnprocessedQueue(t *testing.T) {
 	_, err = s.Register(context.Background(), a.raw, nil, time.Now(), "empty")
 	require.NoError(t, err)
 	require.Len(t, s.Wake(), 1)
-	require.EqualValues(t, len(a.raw), s.Stats().UnprocessedInMemory)
 
 	got, payload, ok := s.Next()
 	require.True(t, ok)
@@ -168,63 +197,13 @@ func TestUnprocessedQueue(t *testing.T) {
 	got, payload, ok = s.Next()
 	require.True(t, ok)
 	require.Same(t, rb, got)
-	require.Nil(t, payload, "over the memory budget")
-	td, released, err := s.ReadUnprocessed(rb)
-	require.NoError(t, err)
-	require.False(t, released)
-	require.Equal(t, b.spans, td.SpanCount())
+	require.Equal(t, "b", payload)
 	s.Begin(rb)
 
 	_, _, ok = s.Next()
 	require.False(t, ok, "a record without associations is not queued")
-	st := s.Stats()
-	require.Zero(t, st.UnprocessedRecords)
-	require.Zero(t, st.UnprocessedBytes)
-	require.Zero(t, st.UnprocessedInMemory)
-	require.EqualValues(t, 1, st.UnprocessedReads)
+	require.Zero(t, s.Stats().UnprocessedRecords)
 	require.NoError(t, s.Stop())
-}
-
-func TestQueuedTraces(t *testing.T) {
-	cfg := testConfig(t.TempDir())
-	cfg.MaxUnprocessedMemory = 0
-	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
-	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Stop()) }()
-	r := rand.New(rand.NewPCG(4, 4))
-	var next uint64
-	a, b, c := pcommon.TraceID{1}, pcommon.TraceID{2}, pcommon.TraceID{3}
-	queued := func() map[pcommon.TraceID]uint64 {
-		got := map[pcommon.TraceID]uint64{}
-		s.Queued(map[pcommon.TraceID]struct{}{a: {}, b: {}, c: {}}, func(id pcommon.TraceID, last uint64) { got[id] = last })
-		return got
-	}
-
-	require.Empty(t, queued())
-	require.True(t, s.Begun(0))
-	first, err := newTestRequest(t, r, &next, a, b).register(s, context.Background(), nil)
-	require.NoError(t, err)
-	second, err := newTestRequest(t, r, &next, a).register(s, context.Background(), nil)
-	require.NoError(t, err)
-	require.Equal(t, map[pcommon.TraceID]uint64{a: second.Seq(), b: first.Seq()}, queued())
-	require.False(t, s.Begun(first.Seq()))
-
-	s.Begin(first)
-	require.True(t, s.Begun(first.Seq()))
-	require.False(t, s.Begun(second.Seq()))
-	require.Equal(t, map[pcommon.TraceID]uint64{a: second.Seq()}, queued())
-
-	// A record released unread leaves the queue too.
-	s.readAt = func(*segment, []byte, int64) (int, error) { return 0, errors.New("injected") }
-	for {
-		_, released, err := s.ReadUnprocessed(second)
-		require.Error(t, err)
-		if released {
-			break
-		}
-	}
-	require.Empty(t, queued())
-	require.True(t, s.Begun(second.Seq()))
 }
 
 func TestCheckpointKeepsFramesWrittenMeanwhile(t *testing.T) {

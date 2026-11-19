@@ -54,6 +54,9 @@ func (s *Spool) Start() {
 // yet delivered stay on disk for the next start.
 func (s *Spool) Stop() error {
 	s.mu.Lock()
+	if !s.stopping {
+		close(s.stopped)
+	}
 	s.stopping = true
 	for t := range s.retryTimers {
 		t.Stop()

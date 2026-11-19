@@ -25,7 +25,6 @@ import (
 
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 )
 
@@ -48,15 +47,9 @@ type Config struct {
 	KeepMemo int
 	DropMemo int
 
-	// MaxUnprocessedMemory bounds the stored bytes of unprocessed records
-	// whose decoded fragments are kept in memory; the others are read back
-	// when the processor gets to them.
-	MaxUnprocessedMemory int64
-	// MaxUnprocessedRecords and MaxUnprocessedBytes reject new requests while
-	// that many records or stored bytes wait for the processor. Zero means
-	// no limit.
-	MaxUnprocessedRecords int
-	MaxUnprocessedBytes   int64
+	// MaxUnprocessed makes Register wait, before writing anything, while
+	// that many records wait for the processor. Zero means no limit.
+	MaxUnprocessed int
 	// MinFreeDisk rejects new requests while the directory's file system has
 	// less free space. Zero disables the check.
 	MinFreeDisk int64
@@ -69,8 +62,8 @@ type Config struct {
 	ReadRetries int
 }
 
-// ErrBackpressure is returned by Register while the spool is over one of
-// its limits. The request was not registered and may be retried.
+// ErrBackpressure is returned by Register while the disk is short of free
+// space. The request was not registered and may be retried.
 var ErrBackpressure = errors.New("tail spool is over its limits")
 
 type assocState uint8
@@ -106,7 +99,7 @@ type Record struct {
 	done         bool
 	readFailures int
 	// payload is what the processor passed to Register, kept until the
-	// record is processed if it fits in MaxUnprocessedMemory.
+	// record is processed.
 	payload any
 }
 
@@ -145,15 +138,14 @@ type Spool struct {
 	err     error
 
 	// unprocessed holds registered records in sequence order until the
-	// processor begins them; wake signals that it is not empty. lastQueued
-	// maps the traces they hold to the last of them holding each.
-	unprocessed       []*Record
-	lastQueued        map[pcommon.TraceID]uint64
-	unprocessedBytes  int64
-	unprocessedMemory int64
-	wake              chan struct{}
-	freeDisk          int64
-	freeDiskChecked   time.Time
+	// processor begins them; wake signals that it is not empty. room holds
+	// a token for each of them and for each Register writing one, and is nil
+	// without MaxUnprocessed.
+	unprocessed     []*Record
+	room            chan struct{}
+	wake            chan struct{}
+	freeDisk        int64
+	freeDiskChecked time.Time
 
 	// checkpointing is set while a checkpoint is written outside the lock;
 	// lastSnapshot is the size of the last one written.
@@ -166,6 +158,7 @@ type Spool struct {
 	readyCond   *sync.Cond
 	retryTimers map[*time.Timer]struct{}
 	stopping    bool
+	stopped     chan struct{}
 	workers     sync.WaitGroup
 	inflight    int64
 	stats       Stats
@@ -196,18 +189,14 @@ type Stats struct {
 	// they were written.
 	RejectedExpired      uint64
 	RejectedBackpressure uint64
-	// UnprocessedReads counts unprocessed records read back from disk.
-	UnprocessedReads    uint64
-	Evicted             uint64
-	Checkpoints         uint64
-	LiveRecords         int
-	LiveSegments        int
-	PendingTraces       int
-	ReadyRecords        int
-	RetryingRecords     int
-	UnprocessedRecords  int
-	UnprocessedBytes    int64
-	UnprocessedInMemory int64
+	Evicted              uint64
+	Checkpoints          uint64
+	LiveRecords          int
+	LiveSegments         int
+	PendingTraces        int
+	ReadyRecords         int
+	RetryingRecords      int
+	UnprocessedRecords   int
 }
 
 var errStopped = errors.New("tail spool is stopped")
@@ -220,14 +209,24 @@ func (s *Spool) fail(err error) error {
 	return s.err
 }
 
-// Register appends raw and registers its associations, then queues the
+// Register waits until fewer than MaxUnprocessed records wait for the
+// processor, appends raw and registers its associations, then queues the
 // record for the processor with payload, which Next returns. The request may
 // be acknowledged once Register returns without error; it returns ctx's error
 // without writing anything if ctx is done by the time the record would be
 // written.
 func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arrival time.Time, payload any) (*Record, error) {
+	if err := s.waitForRoom(ctx); err != nil {
+		return nil, err
+	}
+	queued := false
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		if !queued {
+			s.freeRoomLocked()
+		}
+		s.mu.Unlock()
+	}()
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -239,7 +238,7 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 			return nil, s.fail(err)
 		}
 	}
-	if err := s.admitLocked(ctx, int64(len(raw))); err != nil {
+	if err := s.admitLocked(ctx); err != nil {
 		return nil, err
 	}
 	seg := s.active
@@ -270,24 +269,43 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 	if r.open == 0 {
 		s.finishLocked(r)
 	} else {
-		if payload != nil && s.unprocessedMemory+int64(r.length) <= s.cfg.MaxUnprocessedMemory {
-			r.payload = payload
-			s.unprocessedMemory += int64(r.length)
-		}
+		r.payload = payload
 		s.unprocessed = append(s.unprocessed, r)
-		s.unprocessedBytes += int64(r.length)
-		for _, a := range assocs {
-			s.lastQueued[a.ID] = r.seq
-		}
+		queued = true
 		s.pokeLocked()
 	}
 	s.maybeCheckpointLocked()
 	return r, nil
 }
 
-// admitLocked refuses a request of n bytes that expired or would exceed a
-// limit, before anything is written.
-func (s *Spool) admitLocked(ctx context.Context, n int64) error {
+// waitForRoom takes a token of room, waiting while it is full, as the
+// in-memory processor makes the client wait while its work channel is.
+func (s *Spool) waitForRoom(ctx context.Context) error {
+	if s.room == nil {
+		return nil
+	}
+	select {
+	case s.room <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		s.stats.RejectedExpired++
+		s.mu.Unlock()
+		return ctx.Err()
+	case <-s.stopped:
+		return errStopped
+	}
+}
+
+func (s *Spool) freeRoomLocked() {
+	if s.room != nil {
+		<-s.room
+	}
+}
+
+// admitLocked refuses a request that expired or finds the disk short of
+// space, before anything is written.
+func (s *Spool) admitLocked(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		s.stats.RejectedExpired++
 		return err
@@ -296,20 +314,11 @@ func (s *Spool) admitLocked(ctx context.Context, n int64) error {
 		s.stats.RejectedExpired++
 		return fmt.Errorf("%w: less than %v left", context.DeadlineExceeded, s.cfg.MinDeadlineRemaining)
 	}
-	var reason string
-	switch {
-	case s.cfg.MaxUnprocessedRecords > 0 && len(s.unprocessed) >= s.cfg.MaxUnprocessedRecords:
-		reason = "unprocessed records"
-	// A single request larger than the limit is still taken when nothing waits.
-	case s.cfg.MaxUnprocessedBytes > 0 && len(s.unprocessed) > 0 && s.unprocessedBytes+n > s.cfg.MaxUnprocessedBytes:
-		reason = "unprocessed bytes"
-	case s.cfg.MinFreeDisk > 0 && s.freeDiskLocked() < s.cfg.MinFreeDisk:
-		reason = "free disk space"
-	default:
-		return nil
+	if s.cfg.MinFreeDisk > 0 && s.freeDiskLocked() < s.cfg.MinFreeDisk {
+		s.stats.RejectedBackpressure++
+		return fmt.Errorf("%w: free disk space", ErrBackpressure)
 	}
-	s.stats.RejectedBackpressure++
-	return fmt.Errorf("%w: %s", ErrBackpressure, reason)
+	return nil
 }
 
 // freeDiskLocked returns the free space of the directory's file system,
@@ -352,8 +361,7 @@ func (s *Spool) pokeLocked() {
 }
 
 // Next returns the oldest record not yet begun and the payload passed to
-// Register, which is nil if it did not fit in memory. The record stays
-// queued until Begin.
+// Register. The record stays queued until Begin.
 func (s *Spool) Next() (*Record, any, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -362,48 +370,6 @@ func (s *Spool) Next() (*Record, any, bool) {
 	}
 	r := s.unprocessed[0]
 	return r, r.payload, true
-}
-
-// Queued calls queued for each of the traces with fragments in records not
-// begun yet, with the sequence number of the last of these records.
-func (s *Spool) Queued(traces map[pcommon.TraceID]struct{}, queued func(id pcommon.TraceID, last uint64)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.lastQueued) == 0 {
-		return
-	}
-	for id := range traces {
-		if last, ok := s.lastQueued[id]; ok {
-			queued(id, last)
-		}
-	}
-}
-
-// Begun reports whether every record up to seq has been begun or released.
-func (s *Spool) Begun(seq uint64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.unprocessed) == 0 || s.unprocessed[0].seq > seq
-}
-
-// ReadUnprocessed decodes a queued record whose payload was not kept. A
-// record that cannot be read and is not to be read again is released with
-// its fragments dropped; released reports it, and the queue moves on.
-func (s *Spool) ReadUnprocessed(r *Record) (td ptrace.Traces, released bool, err error) {
-	td, err = s.readRecord(r)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err == nil {
-		s.stats.UnprocessedReads++
-		return td, false, nil
-	}
-	if s.retryReadLocked(r, err) {
-		return td, false, err
-	}
-	s.dequeueLocked(r)
-	s.releaseUnreadableLocked(r, err)
-	s.wm = max(s.wm, r.seq)
-	return td, true, err
 }
 
 // Attach adds the record's association i to the trace's pending instance.
@@ -485,16 +451,8 @@ func (s *Spool) dequeueLocked(r *Record) {
 	}
 	s.unprocessed[0] = nil
 	s.unprocessed = s.unprocessed[1:]
-	s.unprocessedBytes -= int64(r.length)
-	for _, a := range r.assocs {
-		if s.lastQueued[a.ID] == r.seq {
-			delete(s.lastQueued, a.ID)
-		}
-	}
-	if r.payload != nil {
-		r.payload = nil
-		s.unprocessedMemory -= int64(r.length)
-	}
+	r.payload = nil
+	s.freeRoomLocked()
 	if len(s.unprocessed) > 0 {
 		s.pokeLocked()
 	}
@@ -528,8 +486,6 @@ func (s *Spool) Stats() Stats {
 	st.ReadyRecords = len(s.ready)
 	st.RetryingRecords = len(s.retryTimers)
 	st.UnprocessedRecords = len(s.unprocessed)
-	st.UnprocessedBytes = s.unprocessedBytes
-	st.UnprocessedInMemory = s.unprocessedMemory
 	return st
 }
 
