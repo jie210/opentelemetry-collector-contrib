@@ -235,11 +235,11 @@ func truncateSegmentOf(t *testing.T, dir string, want []byte) string {
 	return ""
 }
 
-// A tick waits for the requests registered before it, so the error span of
-// trace 1, acknowledged within its decision window, counts however long
-// the requests ahead of it take. Trace 1's deadline passes many times over
-// meanwhile.
-func TestSpoolTickWaitsForRegisteredRequests(t *testing.T) {
+// A trace due while fragments of it are queued waits for them, so the error
+// span of trace 1, acknowledged within its decision window, counts however
+// long the requests ahead of it take. Trace 1's deadline passes many times
+// over meanwhile. Trace 4, with nothing queued, is decided on time.
+func TestSpoolTickWaitsForQueuedFragments(t *testing.T) {
 	cases := []struct {
 		name string
 		// fillers are requests of unrelated traces between the spans.
@@ -280,6 +280,7 @@ func TestSpoolTickWaitsForRegisteredRequests(t *testing.T) {
 
 			unblock := blockLoop(c)
 			require.NoError(t, p.ConsumeTraces(context.Background(), spanOf(1, 1, false)))
+			require.NoError(t, p.ConsumeTraces(context.Background(), spanOf(4, 4, true)))
 			for _, td := range fillers {
 				require.NoError(t, p.ConsumeTraces(context.Background(), td))
 			}
@@ -293,13 +294,19 @@ func TestSpoolTickWaitsForRegisteredRequests(t *testing.T) {
 				require.Eventually(t, func() bool { return sp.Stats().ReadFailures >= 1 }, 5*time.Second, time.Millisecond)
 				require.NoError(t, os.WriteFile(seg, bData, 0o640))
 			}
+			var early map[pcommon.SpanID]int
+			require.Eventually(t, func() bool {
+				early, _ = sink.snapshot()
+				return early[pcommon.SpanID{4}] == 1
+			}, 5*time.Second, time.Millisecond)
+			require.Zero(t, early[pcommon.SpanID{3}], "trace 4 is not held with trace 1")
 
 			require.Eventually(t, func() bool {
 				st := sp.Stats()
 				return st.UnprocessedRecords == 0 && st.PendingTraces == 0 && st.LiveRecords == 0
 			}, 10*time.Second, time.Millisecond)
 			spans, _ := sink.snapshot()
-			require.Equal(t, map[pcommon.SpanID]int{{1}: 1, {3}: 1}, spans)
+			require.Equal(t, map[pcommon.SpanID]int{{1}: 1, {3}: 1, {4}: 1}, spans)
 			if tc.fault && !tc.recover {
 				require.EqualValues(t, 1, sp.Stats().ReleasedUnreadable)
 			} else {

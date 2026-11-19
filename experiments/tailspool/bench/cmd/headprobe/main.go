@@ -28,14 +28,19 @@ type sink struct {
 	ptraceotlp.UnimplementedGRPCServer
 	mu    sync.Mutex
 	spans map[pcommon.SpanID]int
+	first map[pcommon.SpanID]time.Time
 }
 
 func (s *sink) Export(_ context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, rs := range req.Traces().ResourceSpans().All() {
 		for _, ss := range rs.ScopeSpans().All() {
 			for _, sp := range ss.Spans().All() {
+				if s.spans[sp.SpanID()] == 0 {
+					s.first[sp.SpanID()] = now
+				}
 				s.spans[sp.SpanID()]++
 			}
 		}
@@ -47,6 +52,16 @@ func (s *sink) count(id pcommon.SpanID) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.spans[id]
+}
+
+// exportedAt reports when the span was first exported, relative to t0.
+func (s *sink) exportedAt(id pcommon.SpanID, t0 time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.first[id]; ok {
+		return "+" + t.Sub(t0).Round(time.Millisecond).String()
+	}
+	return "never"
 }
 
 func id16(kind byte, n uint32) pcommon.TraceID {
@@ -86,7 +101,7 @@ func main() {
 	senders := flag.Int("senders", 8, "concurrent filler senders")
 	flag.Parse()
 
-	s := &sink{spans: map[pcommon.SpanID]int{}}
+	s := &sink{spans: map[pcommon.SpanID]int{}, first: map[pcommon.SpanID]time.Time{}}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
@@ -118,9 +133,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// U is an error trace with nothing sent after it, decided on time
+	// unless unrelated requests hold it.
+	u := sid(0xD4, 1)
 	t0 := time.Now()
 	send(spanTraces(traceA, a1, false))
-	log.Printf("A normal span acknowledged")
+	send(spanTraces(id16(0xD4, 0), u, true))
+	log.Printf("A normal span and U acknowledged")
 	time.Sleep(time.Until(t0.Add(*fillersAt)))
 
 	fillerBase := id16(0xF0, 0)
@@ -229,5 +248,6 @@ func main() {
 	default:
 		time.Sleep(5 * time.Second)
 	}
-	log.Printf("final: A normal=%d A error=%d", s.count(a1), s.count(a2))
+	log.Printf("final: A normal=%d A error=%d U=%d", s.count(a1), s.count(a2), s.count(u))
+	log.Printf("exported at: A normal %s, A error %s, U %s", s.exportedAt(a1, t0), s.exportedAt(a2, t0), s.exportedAt(u, t0))
 }

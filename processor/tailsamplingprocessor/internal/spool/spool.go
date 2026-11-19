@@ -143,10 +143,10 @@ type Spool struct {
 	err     error
 
 	// unprocessed holds registered records in sequence order until the
-	// processor begins them; wake signals that it is not empty. lastArrival
-	// keeps their arrivals in sequence order too.
+	// processor begins them; wake signals that it is not empty. lastQueued
+	// maps the traces they hold to the last of them holding each.
 	unprocessed       []*Record
-	lastArrival       int64
+	lastQueued        map[pcommon.TraceID]uint64
 	unprocessedBytes  int64
 	unprocessedMemory int64
 	wake              chan struct{}
@@ -250,9 +250,8 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 	if err != nil {
 		return nil, s.fail(fmt.Errorf("append to segment %d: %w", seg.id, err))
 	}
-	s.lastArrival = max(s.lastArrival, arrival.UnixNano())
 	r := &Record{
-		seq: s.nextSeq, seg: seg, off: off, length: uint32(len(raw)), arrival: s.lastArrival,
+		seq: s.nextSeq, seg: seg, off: off, length: uint32(len(raw)), arrival: arrival.UnixNano(),
 		assocs: assocs, state: make([]assocState, len(assocs)), open: len(assocs),
 	}
 	s.nextSeq++
@@ -275,6 +274,9 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 		}
 		s.unprocessed = append(s.unprocessed, r)
 		s.unprocessedBytes += int64(r.length)
+		for _, a := range assocs {
+			s.lastQueued[a.ID] = r.seq
+		}
 		s.pokeLocked()
 	}
 	s.maybeCheckpointLocked()
@@ -360,12 +362,26 @@ func (s *Spool) Next() (*Record, any, bool) {
 	return r, r.payload, true
 }
 
-// WaitingSince reports whether a record that arrived at or before t waits
-// for Begin.
-func (s *Spool) WaitingSince(t time.Time) bool {
+// Queued calls queued for each of the traces with fragments in records not
+// begun yet, with the sequence number of the last of these records.
+func (s *Spool) Queued(traces map[pcommon.TraceID]struct{}, queued func(id pcommon.TraceID, last uint64)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.unprocessed) > 0 && s.unprocessed[0].arrival <= t.UnixNano()
+	if len(s.lastQueued) == 0 {
+		return
+	}
+	for id := range traces {
+		if last, ok := s.lastQueued[id]; ok {
+			queued(id, last)
+		}
+	}
+}
+
+// Begun reports whether every record up to seq has been begun or released.
+func (s *Spool) Begun(seq uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.unprocessed) == 0 || s.unprocessed[0].seq > seq
 }
 
 // ReadUnprocessed decodes a queued record whose payload was not kept. A
@@ -471,6 +487,11 @@ func (s *Spool) dequeueLocked(r *Record) {
 	s.unprocessed[0] = nil
 	s.unprocessed = s.unprocessed[1:]
 	s.unprocessedBytes -= int64(r.length)
+	for _, a := range r.assocs {
+		if s.lastQueued[a.ID] == r.seq {
+			delete(s.lastQueued, a.ID)
+		}
+	}
 	if r.payload != nil {
 		r.payload = nil
 		s.unprocessedMemory -= int64(r.length)

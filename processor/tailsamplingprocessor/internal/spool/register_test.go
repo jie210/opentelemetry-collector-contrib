@@ -5,6 +5,7 @@ package spool
 
 import (
 	"context"
+	"errors"
 	"math"
 	"math/rand/v2"
 	"runtime"
@@ -184,29 +185,46 @@ func TestUnprocessedQueue(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
-func TestWaitingSince(t *testing.T) {
-	s, _, err := Open(testConfig(t.TempDir()), zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+func TestQueuedTraces(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.MaxUnprocessedMemory = 0
+	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, s.Stop()) }()
 	r := rand.New(rand.NewPCG(4, 4))
 	var next uint64
-	req := newTestRequest(t, r, &next, pcommon.TraceID{1})
-	t0 := time.Unix(1700000000, 0)
+	a, b, c := pcommon.TraceID{1}, pcommon.TraceID{2}, pcommon.TraceID{3}
+	queued := func() map[pcommon.TraceID]uint64 {
+		got := map[pcommon.TraceID]uint64{}
+		s.Queued(map[pcommon.TraceID]struct{}{a: {}, b: {}, c: {}}, func(id pcommon.TraceID, last uint64) { got[id] = last })
+		return got
+	}
 
-	require.False(t, s.WaitingSince(t0))
-	first, err := s.Register(context.Background(), req.raw, req.assocs, t0, nil)
+	require.Empty(t, queued())
+	require.True(t, s.Begun(0))
+	first, err := newTestRequest(t, r, &next, a, b).register(s, context.Background(), nil)
 	require.NoError(t, err)
-	// Taken by the lock after the first, so it arrived no earlier.
-	second, err := s.Register(context.Background(), req.raw, req.assocs, t0.Add(-time.Millisecond), nil)
+	second, err := newTestRequest(t, r, &next, a).register(s, context.Background(), nil)
 	require.NoError(t, err)
-	require.Equal(t, t0, second.Arrival())
+	require.Equal(t, map[pcommon.TraceID]uint64{a: second.Seq(), b: first.Seq()}, queued())
+	require.False(t, s.Begun(first.Seq()))
 
-	require.False(t, s.WaitingSince(t0.Add(-time.Nanosecond)))
-	require.True(t, s.WaitingSince(t0))
 	s.Begin(first)
-	require.True(t, s.WaitingSince(t0))
-	s.Begin(second)
-	require.False(t, s.WaitingSince(t0.Add(time.Hour)))
+	require.True(t, s.Begun(first.Seq()))
+	require.False(t, s.Begun(second.Seq()))
+	require.Equal(t, map[pcommon.TraceID]uint64{a: second.Seq()}, queued())
+
+	// A record released unread leaves the queue too.
+	s.readAt = func(*segment, []byte, int64) (int, error) { return 0, errors.New("injected") }
+	for {
+		_, released, err := s.ReadUnprocessed(second)
+		require.Error(t, err)
+		if released {
+			break
+		}
+	}
+	require.Empty(t, queued())
+	require.True(t, s.Begun(second.Seq()))
 }
 
 func TestCheckpointKeepsFramesWrittenMeanwhile(t *testing.T) {

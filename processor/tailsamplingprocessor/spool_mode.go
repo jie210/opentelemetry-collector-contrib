@@ -4,15 +4,18 @@
 package tailsamplingprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor"
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/idbatcher"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/sampling"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/telemetry"
@@ -133,6 +136,52 @@ func (tsp *tailSamplingSpanProcessor) processNextSpooled(tickChan <-chan time.Ti
 		batch = spooledFragments(td, open)
 	}
 	tsp.processSpooledRecord(rec, batch, tickChan)
+}
+
+// heldTrace is a trace due a decision while fragments of it were queued,
+// last being the sequence number of the last record holding one then.
+type heldTrace struct {
+	id   pcommon.TraceID
+	last uint64
+}
+
+// heldTraces is a min-heap of held traces by the record they wait for.
+type heldTraces []heldTrace
+
+func (h heldTraces) Len() int           { return len(h) }
+func (h heldTraces) Less(i, j int) bool { return h[i].last < h[j].last }
+func (h heldTraces) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *heldTraces) Push(x any)        { *h = append(*h, x.(heldTrace)) }
+
+func (h *heldTraces) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+// holdQueuedTraces moves the traces of batch with fragments still queued to
+// the held ones. Fragments registered later do not hold them further.
+func (tsp *tailSamplingSpanProcessor) holdQueuedTraces(batch idbatcher.Batch) {
+	tsp.spool.Queued(batch, func(id pcommon.TraceID, last uint64) {
+		delete(batch, id)
+		heap.Push(&tsp.held, heldTrace{id: id, last: last})
+	})
+}
+
+// decideReleasedTraces decides the held traces whose fragments queued when
+// they were due have all been processed.
+func (tsp *tailSamplingSpanProcessor) decideReleasedTraces() {
+	var batch idbatcher.Batch
+	for tsp.held.Len() > 0 && tsp.spool.Begun(tsp.held[0].last) {
+		if batch == nil {
+			batch = idbatcher.Batch{}
+		}
+		batch[heap.Pop(&tsp.held).(heldTrace).id] = struct{}{}
+	}
+	if batch != nil {
+		tsp.decideBatch(batch)
+	}
 }
 
 // spooledFragments splits a stored request into the fragments of the open

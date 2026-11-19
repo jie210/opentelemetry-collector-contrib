@@ -161,6 +161,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		nextSeq: 1,
 		wake:    make(chan struct{}, 1),
 
+		lastQueued:  map[pcommon.TraceID]uint64{},
 		retryTimers: map[*time.Timer]struct{}{},
 		readAt:      readSegment,
 	}
