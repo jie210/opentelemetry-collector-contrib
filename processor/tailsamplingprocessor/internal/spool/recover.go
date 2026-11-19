@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -76,8 +77,10 @@ func (s *Spool) removeSegmentLocked(seg *segment) {
 		}
 	}
 	delete(s.segs, seg.id)
-	seg.f.Close()
-	if err := os.Remove(segmentPath(s.cfg.Directory, seg.id)); err != nil {
+	if seg.f != nil {
+		seg.f.Close()
+	}
+	if err := os.Remove(segmentPath(s.cfg.Directory, seg.id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.logger.Warn("Failed to remove tail spool segment", zap.Uint32("segment", seg.id), zap.Error(err))
 	}
 }
@@ -117,6 +120,11 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		pending: map[pcommon.TraceID][]assocRef{},
 		memo:    newMemo(cfg.KeepMemo, cfg.DropMemo),
 		nextSeq: 1,
+
+		badSegs:        map[uint32]bool{},
+		prevRunDelay:   time.Second,
+		minReadBackoff: 100 * time.Millisecond,
+		maxReadBackoff: 30 * time.Second,
 	}
 	s.readyCond = sync.NewCond(&s.mu)
 
@@ -259,8 +267,12 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 			continue
 		}
 		f, err := os.OpenFile(segmentPath(s.cfg.Directory, id), os.O_RDWR, 0)
+		if errors.Is(err, os.ErrNotExist) {
+			// Its records are released below.
+			continue
+		}
 		if err != nil {
-			return nil, fmt.Errorf("%w: open segment %d: %v", errCorrupt, id, err)
+			return nil, fmt.Errorf("open segment %d: %w", id, err)
 		}
 		info, err := f.Stat()
 		if err != nil {
@@ -269,9 +281,16 @@ func (s *Spool) finishReplay() (*Recovered, error) {
 		}
 		seg.f, seg.size = f, info.Size()
 	}
-	for _, r := range s.records {
-		if r.off+int64(r.length) > r.seg.size {
-			return nil, fmt.Errorf("%w: record %d extends past segment %d", errCorrupt, r.seq, r.seg.id)
+	for _, r := range s.sortedRecordsLocked() {
+		switch {
+		case r.seg.f == nil:
+			s.badSegs[r.seg.id] = true
+			s.releaseUnreadableLocked(r, fmt.Errorf("segment %d is missing", r.seg.id))
+		case r.off+int64(r.length) > r.seg.size:
+			s.badSegs[r.seg.id] = true
+			s.releaseUnreadableLocked(r, fmt.Errorf("record extends past the end of segment %d", r.seg.id))
+		default:
+			r.prevRun = true
 		}
 	}
 

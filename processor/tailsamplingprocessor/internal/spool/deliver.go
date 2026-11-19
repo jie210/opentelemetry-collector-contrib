@@ -73,18 +73,21 @@ func (s *Spool) worker() {
 		}
 		s.mu.Unlock()
 
-		delivered := s.deliver(r, keep)
+		delivered, err := s.deliver(r, keep)
 
 		s.mu.Lock()
 		s.inflight -= int64(r.length)
-		if delivered {
+		switch {
+		case delivered:
 			s.appendLocked(&frame{kind: frameCommit, seq: r.seq})
 			if err := s.log.flush(); err != nil {
 				s.fail(err)
 			}
 			s.releaseLocked(r)
 			s.maybeCheckpointLocked()
-		} else {
+		case err != nil:
+			s.readFailedLocked(r, err)
+		default:
 			s.ready = append(s.ready, r)
 		}
 		s.readyCond.Broadcast()
@@ -92,17 +95,45 @@ func (s *Spool) worker() {
 	}
 }
 
+// readFailedLocked schedules another delivery attempt of a record whose
+// bytes could not be read. Records of the current run are retried until
+// they can be read; records of the previous run are released after a few
+// attempts.
+func (s *Spool) readFailedLocked(r *Record, err error) {
+	s.stats.ReadFailures++
+	r.readFailures++
+	if r.prevRun && (s.badSegs[r.seg.id] || r.readFailures >= prevRunReadAttempts) {
+		s.badSegs[r.seg.id] = true
+		s.releaseUnreadableLocked(r, err)
+		return
+	}
+	delay := s.prevRunDelay
+	if !r.prevRun {
+		delay = min(s.minReadBackoff<<min(r.readFailures-1, 20), s.maxReadBackoff)
+	}
+	s.logger.Warn("Failed to read tail spool record, retrying",
+		zap.Uint64("seq", r.seq), zap.Int("failures", r.readFailures), zap.Duration("delay", delay), zap.Error(err))
+	s.retrying++
+	time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.retrying--
+		if s.stopping || r.done {
+			return
+		}
+		s.ready = append(s.ready, r)
+		s.readyCond.Signal()
+	})
+}
+
 // deliver reads the record, keeps the spans of kept traces and hands them to
-// the next consumer, retrying until it succeeds or the spool stops. It
-// reports whether the record is finished.
-func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) bool {
+// the next consumer, retrying the consumer until it succeeds or the spool
+// stops. It reports whether the record was delivered, or the read error that
+// prevented it.
+func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) (bool, error) {
 	td, err := s.readRecord(r)
 	if err != nil {
-		s.logger.Error("Dropping unreadable tail spool record", zap.Uint64("seq", r.seq), zap.Error(err))
-		s.mu.Lock()
-		s.stats.DeliveryFailures++
-		s.mu.Unlock()
-		return true
+		return false, err
 	}
 	spans := filterKept(td, keep)
 	backoff := 50 * time.Millisecond
@@ -113,33 +144,58 @@ func (s *Spool) deliver(r *Record, keep map[Assoc]struct{}) bool {
 			s.stats.Delivered++
 			s.stats.DeliveredSpans += uint64(spans)
 			s.mu.Unlock()
-			return true
+			return true, nil
 		}
 		s.mu.Lock()
 		s.stats.DeliveryFailures++
 		stopping := s.stopping
 		s.mu.Unlock()
 		if stopping {
-			return false
+			return false, nil
 		}
 		s.logger.Warn("Tail spool delivery failed, retrying", zap.Uint64("seq", r.seq), zap.Duration("backoff", backoff), zap.Error(err))
 		time.Sleep(backoff)
 		backoff = min(2*backoff, 5*time.Second)
 		// A consumer may have modified td before failing; start from the
-		// original bytes again.
+		// stored bytes again.
 		if td, err = s.readRecord(r); err != nil {
-			return true
+			return false, err
 		}
 		spans = filterKept(td, keep)
 	}
 }
 
-// ReadRecord decodes the record's original request.
-func (s *Spool) ReadRecord(r *Record) (ptrace.Traces, error) { return s.readRecord(r) }
+// ReadRefeed decodes a record of the previous run whose fragments must be
+// processed again. A record that still cannot be read after a few attempts
+// is released and the read error returned; its spans are lost.
+func (s *Spool) ReadRefeed(r *Record) (ptrace.Traces, error) {
+	for {
+		td, err := s.readRecord(r)
+		if err == nil {
+			return td, nil
+		}
+		s.mu.Lock()
+		s.stats.ReadFailures++
+		r.readFailures++
+		if s.badSegs[r.seg.id] || r.readFailures >= prevRunReadAttempts {
+			s.badSegs[r.seg.id] = true
+			s.releaseUnreadableLocked(r, err)
+			s.mu.Unlock()
+			return ptrace.Traces{}, err
+		}
+		delay := s.prevRunDelay
+		s.mu.Unlock()
+		time.Sleep(delay)
+	}
+}
 
 func (s *Spool) readRecord(r *Record) (ptrace.Traces, error) {
 	buf := make([]byte, r.length)
-	if _, err := r.seg.f.ReadAt(buf, r.off); err != nil {
+	read := s.readAt
+	if read == nil {
+		read = func(seg *segment, p []byte, off int64) (int, error) { return seg.f.ReadAt(p, off) }
+	}
+	if _, err := read(r.seg, buf, r.off); err != nil {
 		return ptrace.Traces{}, fmt.Errorf("read record %d: %w", r.seq, err)
 	}
 	var u ptrace.ProtoUnmarshaler

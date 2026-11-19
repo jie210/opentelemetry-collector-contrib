@@ -13,11 +13,11 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/cache"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/rawrequest"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/sampling"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/telemetry"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/pkg/samplingpolicy"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/rawrequest"
 )
 
 var errSpoolNeedsRawRequest = errors.New("tail_sampling spool requires the tailspool receiver directly in front of it")
@@ -250,12 +250,9 @@ func (tsp *tailSamplingSpanProcessor) restoreSpool(recovered *spool.Recovered, t
 
 	var fragments int
 	for _, rr := range recovered.Refeed {
-		td, err := tsp.spool.ReadRecord(rr.Record)
+		td, err := tsp.spool.ReadRefeed(rr.Record)
 		if err != nil {
-			tsp.logger.Error("Dropping unreadable tail spool record", zap.Uint64("seq", rr.Record.Seq()), zap.Error(err))
-			for _, idx := range rr.Assocs {
-				tsp.spool.Inherit(rr.Record, idx, false)
-			}
+			// The spool released the record and logged the loss.
 			continue
 		}
 		open := make(map[spool.Assoc]int, len(rr.Assocs))
