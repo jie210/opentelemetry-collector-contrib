@@ -104,7 +104,7 @@ func (s *Spool) syncSegment(seg *segment) {
 	defer s.mu.Unlock()
 	seg.syncing = false
 	if err != nil {
-		s.fail(fmt.Errorf("sync segment %d: %w", seg.id, err))
+		s.fatalLocked("sync segment", segmentPath(s.cfg.Directory, seg.id), err)
 	}
 	if seg.refs == 0 && s.segs[seg.id] == seg {
 		s.removeSegmentLocked(seg)
@@ -121,8 +121,7 @@ func (s *Spool) removeSegmentLocked(seg *segment) {
 	// restart would find registrations pointing into a removed segment.
 	if s.log != nil {
 		if err := s.log.flush(); err != nil {
-			s.fail(err)
-			return
+			s.fatalLocked("flush WAL before segment removal", logPath(s.cfg.Directory), err, zap.Uint32("segment", seg.id))
 		}
 	}
 	delete(s.segs, seg.id)
@@ -211,6 +210,11 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 
 	rec, err := s.finishReplay(rp.pending)
 	if err != nil {
+		for _, seg := range s.segs {
+			if seg.f != nil {
+				seg.f.Close()
+			}
+		}
 		f.Close()
 		return nil, nil, err
 	}
@@ -357,10 +361,16 @@ func (s *Spool) finishReplay(instances map[pcommon.TraceID]*Pending) (*Recovered
 		seg.f, seg.size = f, info.Size()
 	}
 	for _, r := range s.sortedRecordsLocked() {
+		var readErr error
 		if r.seg.f == nil {
-			s.releaseUnreadableLocked(r, fmt.Errorf("segment %d is missing", r.seg.id))
+			readErr = fmt.Errorf("segment %d is missing", r.seg.id)
 		} else if r.off+int64(r.length) > r.seg.size {
-			s.releaseUnreadableLocked(r, fmt.Errorf("record %d extends past segment %d", r.seq, r.seg.id))
+			readErr = fmt.Errorf("record %d extends past segment %d", r.seq, r.seg.id)
+		}
+		if readErr != nil {
+			if err := s.commitUnreadableLocked(r, readErr); err != nil {
+				return nil, fmt.Errorf("commit unreadable record %d: %w", r.seq, err)
+			}
 		}
 	}
 
@@ -413,15 +423,19 @@ func (s *Spool) finishReplay(instances map[pcommon.TraceID]*Pending) (*Recovered
 		return nil, err
 	}
 	s.active = active
-	s.checkpointLocked()
-	return rec, s.err
+	tmp := logPath(s.cfg.Directory) + ".tmp"
+	w, err := writeSnapshot(tmp, s.snapshotLocked())
+	if err != nil {
+		return nil, err
+	}
+	return rec, s.installLocked(w, tmp, w.size)
 }
 
 // maybeCheckpointLocked starts a checkpoint once the log has grown well past
 // the last one, which keeps a large live state from being rewritten over and
 // over.
 func (s *Spool) maybeCheckpointLocked() {
-	if s.cfg.CheckpointBytes <= 0 || s.checkpointing || s.stopping || s.err != nil {
+	if s.cfg.CheckpointBytes <= 0 || s.checkpointing || s.stopping {
 		return
 	}
 	if s.log.size <= max(s.cfg.CheckpointBytes, 2*s.lastSnapshot) {
@@ -442,7 +456,7 @@ func (s *Spool) checkpoint(frames []frame) {
 	tmp := logPath(s.cfg.Directory) + ".tmp"
 	w, err := writeSnapshot(tmp, frames)
 	if s.snapshotWritten != nil {
-		s.snapshotWritten()
+		s.snapshotWritten(w)
 	}
 
 	s.mu.Lock()
@@ -451,10 +465,9 @@ func (s *Spool) checkpoint(frames []frame) {
 	s.log.tail = nil
 	s.checkpointing = false
 	if err != nil {
-		s.fail(fmt.Errorf("write checkpoint: %w", err))
-		return
+		s.fatalLocked("write checkpoint", tmp, err)
 	}
-	if s.stopping || s.err != nil {
+	if s.stopping {
 		w.f.Close()
 		os.Remove(tmp)
 		return
@@ -462,32 +475,22 @@ func (s *Spool) checkpoint(frames []frame) {
 	snapshot := w.size
 	if err := w.appendEncoded(tail); err != nil {
 		w.f.Close()
-		s.fail(fmt.Errorf("write checkpoint: %w", err))
-		return
+		s.fatalLocked("append checkpoint tail", tmp, err)
 	}
-	s.installLocked(w, tmp, snapshot)
+	if err := s.installLocked(w, tmp, snapshot); err != nil {
+		s.fatalLocked("install checkpoint", tmp, err)
+	}
 }
 
-// checkpointLocked rewrites the live state into a new log and atomically
-// replaces the old one. Open uses it before anything else runs.
-func (s *Spool) checkpointLocked() {
-	if s.err != nil {
-		return
+func (s *Spool) installLocked(w *logWriter, tmp string, snapshot int64) error {
+	// Both the snapshot and its tail must reach the file before it replaces the live WAL.
+	if err := w.f.Sync(); err != nil {
+		w.f.Close()
+		return fmt.Errorf("sync checkpoint: %w", err)
 	}
-	tmp := logPath(s.cfg.Directory) + ".tmp"
-	w, err := writeSnapshot(tmp, s.snapshotLocked())
-	if err != nil {
-		s.fail(fmt.Errorf("write checkpoint: %w", err))
-		return
-	}
-	s.installLocked(w, tmp, w.size)
-}
-
-func (s *Spool) installLocked(w *logWriter, tmp string, snapshot int64) {
 	if err := os.Rename(tmp, logPath(s.cfg.Directory)); err != nil {
 		w.f.Close()
-		s.fail(fmt.Errorf("write checkpoint: %w", err))
-		return
+		return err
 	}
 	if s.log != nil {
 		s.log.f.Close()
@@ -495,6 +498,7 @@ func (s *Spool) installLocked(w *logWriter, tmp string, snapshot int64) {
 	s.log = w
 	s.lastSnapshot = snapshot
 	s.stats.Checkpoints++
+	return nil
 }
 
 // snapshotLocked returns the frames that rebuild the live state.

@@ -75,10 +75,7 @@ func (s *Spool) Stop() error {
 		seg.f.Close()
 	}
 	s.lock.Close()
-	if err != nil {
-		return err
-	}
-	return s.err
+	return err
 }
 
 func (s *Spool) overBudgetLocked(r *Record) bool {
@@ -115,7 +112,7 @@ func (s *Spool) worker() {
 		case delivered:
 			s.appendLocked(&frame{kind: frameCommit, seq: r.seq})
 			if err := s.log.flush(); err != nil {
-				s.fail(err)
+				s.fatalLocked("flush delivery commit", logPath(s.cfg.Directory), err, zap.Uint64("seq", r.seq))
 			}
 			s.releaseLocked(r)
 			s.maybeCheckpointLocked()
@@ -159,8 +156,15 @@ func (s *Spool) readFailedLocked(r *Record, err error) {
 // associations settle as drop and the record is committed so its segment can
 // be reclaimed.
 func (s *Spool) releaseUnreadableLocked(r *Record, err error) {
+	if writeErr := s.commitUnreadableLocked(r, err); writeErr != nil {
+		s.fatalLocked("commit unreadable record", logPath(s.cfg.Directory), writeErr, zap.Uint64("seq", r.seq))
+	}
+}
+
+// Open calls this directly so startup I/O failures propagate to its caller.
+func (s *Spool) commitUnreadableLocked(r *Record, err error) error {
 	if r.done {
-		return
+		return nil
 	}
 	s.logger.Error("Releasing unreadable tail spool record",
 		zap.Uint64("seq", r.seq), zap.Uint32("segment", r.seg.id), zap.Int64("offset", r.off),
@@ -168,7 +172,9 @@ func (s *Spool) releaseUnreadableLocked(r *Record, err error) {
 		zap.Error(err))
 	for i, st := range r.state {
 		if st == unsettled || st == pending {
-			s.appendLocked(&frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: false})
+			if err := s.log.append(&frame{kind: frameLate, seq: r.seq, idx: uint32(i), keep: false}); err != nil {
+				return err
+			}
 			r.state[i] = dropped
 		}
 	}
@@ -179,13 +185,16 @@ func (s *Spool) releaseUnreadableLocked(r *Record, err error) {
 			break
 		}
 	}
-	s.appendLocked(&frame{kind: frameCommit, seq: r.seq})
+	if err := s.log.append(&frame{kind: frameCommit, seq: r.seq}); err != nil {
+		return err
+	}
 	if err := s.log.flush(); err != nil {
-		s.fail(err)
+		return err
 	}
 	s.stats.ReleasedUnreadable++
 	s.stats.ReleasedUnreadableBytes += uint64(r.length)
 	s.releaseLocked(r)
+	return nil
 }
 
 // deliver reads the record, keeps the spans of kept traces and hands them to

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -20,7 +21,9 @@ import (
 	"go.opentelemetry.io/collector/processor/processortest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/sampling"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/internal/spool"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor/pkg/samplingpolicy"
 )
 
 // withManualTicks makes ingestion synchronous and ticks explicit while
@@ -272,17 +275,85 @@ func TestSpoolConfigValidation(t *testing.T) {
 			c.BlockOnOverflow = true
 			c.DecisionCache.SampledCacheSize = 10
 		},
-		"ottl now": func(c *Config) {
-			c.PolicyCfgs = append(c.PolicyCfgs, PolicyCfg{sharedPolicyCfg: sharedPolicyCfg{Name: "and", Type: And}, AndCfg: AndCfg{SubPolicyCfg: []AndSubPolicyCfg{
-				{sharedPolicyCfg: sharedPolicyCfg{Name: "recent", Type: OTTLCondition, OTTLConditionCfg: OTTLConditionCfg{SpanConditions: []string{`end_time > Now()`}}}},
-			}}})
-		},
 	}
 	for name, mutate := range cases {
 		c := valid()
 		mutate(&c)
 		require.Error(t, c.Validate(), name)
 	}
+}
+
+func TestSpoolClockConditions(t *testing.T) {
+	for _, tc := range []struct {
+		condition     string
+		event, reject bool
+	}{
+		{`end_time > Now()`, false, true},
+		{`UUIDv7() == name`, false, true},
+		{`UUID() == name`, false, true},
+		{`Year(Now ()) > 0`, true, true},
+		{`Year(Time("01-10","%m-%d","UTC")) == 2026`, false, true},
+		{`Year(Time("0000-01-10","%F","UTC")) == 2026`, false, true},
+		{`Year(Time(name,"%Y-%m-%d","UTC")) == 2026`, false, true},
+		{`Year(Time("2026-01-10","%Y-%m-%d","UTC")) == 2026`, false, false},
+		{`name == "Now("`, true, false},
+	} {
+		t.Run(tc.condition, func(t *testing.T) {
+			cond := OTTLConditionCfg{}
+			if tc.event {
+				cond.SpanEventConditions = []string{tc.condition}
+			} else {
+				cond.SpanConditions = []string{tc.condition}
+			}
+			policy := sharedPolicyCfg{Name: "condition", Type: OTTLCondition, OTTLConditionCfg: cond}
+			cfg := Config{
+				DecisionWait: time.Second, NumTraces: 10, SamplingStrategy: samplingStrategyTraceComplete,
+				Spool: &SpoolConfig{Directory: t.TempDir()},
+				PolicyCfgs: []PolicyCfg{{
+					sharedPolicyCfg: sharedPolicyCfg{Name: "outer", Type: And},
+					AndCfg:          AndCfg{SubPolicyCfg: []AndSubPolicyCfg{{sharedPolicyCfg: policy}}},
+				}},
+			}
+			for _, spooled := range []bool{true, false} {
+				if !spooled {
+					cfg.Spool = nil
+				}
+				p, err := newTracesProcessor(context.Background(), processortest.NewNopSettings(metadata.Type), newSpanCounter(), cfg)
+				require.NoError(t, err)
+				err = p.Start(context.Background(), componenttest.NewNopHost())
+				if spooled && tc.reject {
+					require.ErrorContains(t, err, "decision time")
+					require.ErrorContains(t, err, "outer")
+					continue
+				}
+				require.NoError(t, err)
+				require.NoError(t, p.Shutdown(context.Background()))
+			}
+		})
+	}
+}
+
+type clockPolicyExtension struct{ extension }
+
+func (*clockPolicyExtension) NewEvaluator(string, map[string]any) (samplingpolicy.Evaluator, error) {
+	return sampling.NewOTTLConditionFilter(processortest.NewNopSettings(metadata.Type).TelemetrySettings, []string{"end_time > Now ()"}, nil, "ignore")
+}
+
+type clockExtensionHost struct{}
+
+func (clockExtensionHost) GetExtensions() map[component.ID]component.Component {
+	return map[component.ID]component.Component{testExtensionID: &clockPolicyExtension{}}
+}
+
+func TestSpoolClockConditionFromExtension(t *testing.T) {
+	cfg := Config{DecisionWait: time.Second, NumTraces: 10, SamplingStrategy: samplingStrategyTraceComplete,
+		Spool:      &SpoolConfig{Directory: t.TempDir()},
+		PolicyCfgs: []PolicyCfg{{sharedPolicyCfg: sharedPolicyCfg{Name: "extension-policy", Type: PolicyType(testExtensionID.String())}}}}
+	p, err := newTracesProcessor(t.Context(), processortest.NewNopSettings(metadata.Type), newSpanCounter(), cfg)
+	require.NoError(t, err)
+	err = p.Start(t.Context(), clockExtensionHost{})
+	require.ErrorContains(t, err, "extension-policy")
+	require.ErrorContains(t, err, "Now")
 }
 
 func newAlwaysSampleSpool(t *testing.T, sink *spanCounter, opts ...func(*Config)) (processor.Traces, *testTSPController) {

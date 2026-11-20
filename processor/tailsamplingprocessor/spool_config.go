@@ -6,7 +6,6 @@ package tailsamplingprocessor // import "github.com/open-telemetry/opentelemetry
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -84,36 +83,6 @@ func (cfg *Config) validateSpool() error {
 		}
 		if cfg.DecisionCache.NonSampledCacheSize <= 0 {
 			return errors.New("spool with block_on_overflow requires decision_cache.non_sampled_cache_size greater than 0")
-		}
-	}
-	for _, p := range cfg.PolicyCfgs {
-		if err := checkFoldablePolicy(p); err != nil {
-			return fmt.Errorf("policy %q: %w", p.Name, err)
-		}
-	}
-	return nil
-}
-
-// checkFoldablePolicy rejects OTTL conditions whose result depends on when
-// they run, since the spool evaluates them when spans arrive.
-func checkFoldablePolicy(p PolicyCfg) error {
-	shared := []sharedPolicyCfg{p.sharedPolicyCfg, p.NotCfg.SubPolicy.sharedPolicyCfg}
-	for _, sub := range p.CompositeCfg.SubPolicyCfg {
-		shared = append(shared, sub.sharedPolicyCfg)
-		for _, and := range sub.AndCfg.SubPolicyCfg {
-			shared = append(shared, and.sharedPolicyCfg, and.NotCfg.SubPolicy.sharedPolicyCfg)
-		}
-	}
-	for _, subs := range [][]AndSubPolicyCfg{p.AndCfg.SubPolicyCfg, p.DropCfg.SubPolicyCfg} {
-		for _, sub := range subs {
-			shared = append(shared, sub.sharedPolicyCfg, sub.NotCfg.SubPolicy.sharedPolicyCfg)
-		}
-	}
-	for _, s := range shared {
-		for _, cond := range append(append([]string{}, s.OTTLConditionCfg.SpanConditions...), s.OTTLConditionCfg.SpanEventConditions...) {
-			if strings.Contains(cond, "Now(") {
-				return fmt.Errorf("ottl condition %q depends on the current time", cond)
-			}
 		}
 	}
 	return nil

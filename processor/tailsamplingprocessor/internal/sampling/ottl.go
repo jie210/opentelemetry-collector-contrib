@@ -6,6 +6,7 @@ package sampling // import "github.com/open-telemetry/opentelemetry-collector-co
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -19,6 +20,7 @@ import (
 )
 
 type ottlConditionFilter struct {
+	foldErr             error
 	sampleSpanExpr      *ottl.ConditionSequence[*ottlspan.TransformContext]
 	sampleSpanEventExpr *ottl.ConditionSequence[*ottlspanevent.TransformContext]
 	errorMode           ottl.ErrorMode
@@ -26,6 +28,32 @@ type ottlConditionFilter struct {
 }
 
 var _ samplingpolicy.Evaluator = (*ottlConditionFilter)(nil)
+
+// Inspect bound calls so nested converters and extension-created evaluators follow
+// the same folding rules. The evaluator itself can always run at decision time.
+type foldCheckedFactory[K any] struct {
+	ottl.Factory[K]
+	conditions []string
+	filter     *ottlConditionFilter
+}
+
+func (f foldCheckedFactory[K]) CreateFunction(ctx ottl.FunctionContext, args ottl.Arguments) (ottl.ExprFunc[K], error) {
+	fn, err := f.Factory.CreateFunction(ctx, args)
+	if err == nil && f.filter.foldErr == nil {
+		clock, ok := args.(interface{ MayReadCurrentTime() bool })
+		if !ok || clock.MayReadCurrentTime() {
+			f.filter.foldErr = fmt.Errorf("OTTL %s in conditions %q can produce different results at arrival and decision time", f.Name(), f.conditions)
+		}
+	}
+	return fn, err
+}
+
+func checkFoldCalls[K any](funcs map[string]ottl.Factory[K], conditions []string, filter *ottlConditionFilter) map[string]ottl.Factory[K] {
+	for _, name := range []string{"Now", "Time", "UUID", "UUIDv7"} {
+		funcs[name] = foldCheckedFactory[K]{funcs[name], conditions, filter}
+	}
+	return funcs
+}
 
 // NewOTTLConditionFilter looks at the trace data and returns a corresponding SamplingDecision.
 func NewOTTLConditionFilter(settings component.TelemetrySettings, spanConditions, spanEventConditions []string, errMode ottl.ErrorMode) (samplingpolicy.Evaluator, error) {
@@ -41,13 +69,13 @@ func NewOTTLConditionFilter(settings component.TelemetrySettings, spanConditions
 	}
 
 	if len(spanConditions) > 0 {
-		if filter.sampleSpanExpr, err = filterottl.NewBoolExprForSpanWithPathContextNames(spanConditions, filterottl.StandardSpanFuncs(), errMode, settings); err != nil {
+		if filter.sampleSpanExpr, err = filterottl.NewBoolExprForSpanWithPathContextNames(spanConditions, checkFoldCalls(filterottl.StandardSpanFuncs(), spanConditions, filter), errMode, settings); err != nil {
 			return nil, err
 		}
 	}
 
 	if len(spanEventConditions) > 0 {
-		if filter.sampleSpanEventExpr, err = filterottl.NewBoolExprForSpanEventWithPathContextNames(spanEventConditions, filterottl.StandardSpanEventFuncs(), errMode, settings); err != nil {
+		if filter.sampleSpanEventExpr, err = filterottl.NewBoolExprForSpanEventWithPathContextNames(spanEventConditions, checkFoldCalls(filterottl.StandardSpanEventFuncs(), spanEventConditions, filter), errMode, settings); err != nil {
 			return nil, err
 		}
 	}

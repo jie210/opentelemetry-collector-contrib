@@ -324,7 +324,7 @@ func TestCheckpointKeepsFramesWrittenMeanwhile(t *testing.T) {
 		written := make(chan struct{})
 		release := make(chan struct{})
 		var hold sync.Once
-		s.snapshotWritten = func() {
+		s.snapshotWritten = func(*logWriter) {
 			hold.Do(func() {
 				written <- struct{}{}
 				<-release

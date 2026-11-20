@@ -19,6 +19,33 @@ type timeArguments[K any] struct {
 	Locale   ottl.Optional[string]
 }
 
+// MayReadCurrentTime reports whether evaluating Time can invoke year inference.
+func (a *timeArguments[K]) MayReadCurrentTime() bool {
+	value, literal := ottl.GetLiteralValue(a.Time)
+	if !literal {
+		return true
+	} // Even an explicit four-digit year can be 0000.
+	var location *string
+	if !a.Location.IsEmpty() {
+		name := a.Location.Get()
+		location = &name
+	}
+	loc, err := timeutils.GetLocation(location, &a.Format)
+	if err != nil {
+		return false
+	}
+	parser, err := timeutils.NewStrptimeParser(a.Format)
+	if err != nil {
+		return false
+	}
+	var language string
+	if !a.Locale.IsEmpty() {
+		language = a.Locale.Get()
+	}
+	t, err := parser.ParseUnadjusted(value, loc, language)
+	return err == nil && t.Year() == 0
+}
+
 // NewTimeFactory returns a factory for the Time OTTL function.
 // See https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/ottl/ottlfuncs/README.md#time
 func NewTimeFactory[K any]() ottl.Factory[K] {

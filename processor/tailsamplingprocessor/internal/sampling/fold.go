@@ -167,8 +167,13 @@ func Fold(e samplingpolicy.Evaluator, plan *FoldPlan) (samplingpolicy.Evaluator,
 		return v, nil
 	case *latency:
 		return plan.add(v, v), nil
+	case *ottlConditionFilter:
+		if v.foldErr != nil {
+			return nil, v.foldErr
+		}
+		return plan.add(v, nil), nil
 	case *statusCodeFilter, *stringAttributeFilter, *numericAttributeFilter, *booleanAttributeFilter,
-		*traceStateFilter, *traceFlags, *ottlConditionFilter:
+		*traceStateFilter, *traceFlags:
 		return plan.add(e, nil), nil
 	case *probabilisticSampler:
 		if v.useTraceState {

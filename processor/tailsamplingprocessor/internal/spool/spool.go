@@ -144,7 +144,6 @@ type Spool struct {
 	// pendingTraces counts the instances holding associations.
 	pendingTraces int
 	memo          *memo
-	err           error
 
 	// unprocessed holds registered records in sequence order until the
 	// processor begins them; wake signals that it is not empty. room holds
@@ -180,7 +179,7 @@ type Spool struct {
 	writeAt func(seg *segment, buf []byte, off int64) (int, error)
 	// snapshotWritten, if set, runs after a checkpoint's snapshot is written
 	// and before it replaces the log; tests use it to hold the checkpoint.
-	snapshotWritten func()
+	snapshotWritten func(*logWriter)
 }
 
 // Stats are cumulative counters exposed for tests and benchmarks.
@@ -214,12 +213,12 @@ type Stats struct {
 
 var errStopped = errors.New("tail spool is stopped")
 
-func (s *Spool) fail(err error) error {
-	if s.err == nil && err != nil {
-		s.err = err
-		s.logger.Error("Tail spool stopped accepting data", zap.Error(err))
-	}
-	return s.err
+// fatalLocked terminates before any deferred unlock or segment cleanup.
+// A failed persistence operation can leave memory ahead of the replayable log.
+func (s *Spool) fatalLocked(op, path string, err error, fields ...zap.Field) {
+	fields = append(fields, zap.String("operation", op), zap.String("path", path), zap.Error(err))
+	s.logger.Error("Fatal tail spool storage failure", fields...)
+	os.Exit(1)
 }
 
 // Register waits until fewer than MaxUnprocessed records wait for the
@@ -265,10 +264,7 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 		}
 	}()
 	if err != nil {
-		return nil, s.fail(fmt.Errorf("append to segment %d: %w", seg.id, err))
-	}
-	if s.err != nil {
-		return nil, s.err
+		s.fatalLocked("write segment", segmentPath(s.cfg.Directory, seg.id), err)
 	}
 	if s.stopping {
 		return nil, errStopped
@@ -279,10 +275,10 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 	}
 	s.nextSeq++
 	if err := s.log.append(&frame{kind: frameRecord, seq: r.seq, seg: seg.id, off: off, length: r.length, arrival: r.arrival, assocs: assocs}); err != nil {
-		return nil, s.fail(err)
+		s.fatalLocked("append registration", logPath(s.cfg.Directory), err, zap.Uint64("seq", r.seq))
 	}
 	if err := s.log.flush(); err != nil {
-		return nil, s.fail(err)
+		s.fatalLocked("flush registration", logPath(s.cfg.Directory), err, zap.Uint64("seq", r.seq))
 	}
 	seg.refs++
 	s.records[r.seq] = r
@@ -302,15 +298,12 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 // reserveLocked checks that a request of n bytes may be written and
 // reserves space for it in the active segment.
 func (s *Spool) reserveLocked(ctx context.Context, n int64) (*segment, int64, error) {
-	if s.err != nil {
-		return nil, 0, s.err
-	}
 	if s.stopping {
 		return nil, 0, errStopped
 	}
 	if s.active.size > 0 && s.active.size+n > s.cfg.SegmentBytes {
 		if err := s.rotate(); err != nil {
-			return nil, 0, s.fail(err)
+			s.fatalLocked("rotate segment", segmentPath(s.cfg.Directory, s.active.id+1), err)
 		}
 	}
 	if err := s.admitLocked(ctx); err != nil {
@@ -527,7 +520,7 @@ func (s *Spool) Flush() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.log.flush(); err != nil {
-		s.fail(err)
+		s.fatalLocked("flush WAL", logPath(s.cfg.Directory), err)
 	}
 	s.maybeCheckpointLocked()
 }
@@ -548,11 +541,11 @@ func (s *Spool) Stats() Stats {
 
 func (s *Spool) appendLocked(f *frame) {
 	// During replay the state is rebuilt from the log and needs no frames.
-	if s.err != nil || s.log == nil {
+	if s.log == nil {
 		return
 	}
 	if err := s.log.append(f); err != nil {
-		s.fail(err)
+		s.fatalLocked("append WAL frame", logPath(s.cfg.Directory), err, zap.Uint8("kind", f.kind), zap.Uint64("seq", f.seq))
 	}
 }
 

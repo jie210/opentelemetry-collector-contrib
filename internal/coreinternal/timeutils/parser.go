@@ -62,6 +62,16 @@ func (f *StrptimeParser) ParseLocalized(value any, location *time.Location, lang
 	})
 }
 
+// ParseUnadjusted parses a timestamp without inferring a missing year from the clock.
+func (f *StrptimeParser) ParseUnadjusted(value string, location *time.Location, language string) (time.Time, error) {
+	return f.parse(func(layout string) (time.Time, error) {
+		if language != "" {
+			return parseLocalizedGotime(layout, value, location, language)
+		}
+		return parseGotime(layout, value, location)
+	})
+}
+
 func GetLocation(location, layout *string) (*time.Location, error) {
 	if location != nil && *location != "" {
 		// If location is specified, it must be in the local timezone database
@@ -86,6 +96,14 @@ func GetLocation(location, layout *string) (*time.Location, error) {
 // The language argument must be a well-formed BCP 47 language tag (e.g.: "en", "en-US"), and
 // a known CLDR locale.
 func ParseLocalizedGotime(layout string, value any, location *time.Location, language string) (time.Time, error) {
+	t, err := parseLocalizedGotime(layout, value, location, language)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return SetTimestampYear(t), nil
+}
+
+func parseLocalizedGotime(layout string, value any, location *time.Location, language string) (time.Time, error) {
 	stringValue, err := convertParsingValue(value)
 	if err != nil {
 		return time.Time{}, err
@@ -96,7 +114,7 @@ func ParseLocalizedGotime(layout string, value any, location *time.Location, lan
 		return time.Time{}, err
 	}
 
-	return ParseGotime(layout, translatedVal, location)
+	return parseGotime(layout, translatedVal, location)
 }
 
 func ParseGotime(layout string, value any, location *time.Location) (time.Time, error) {
