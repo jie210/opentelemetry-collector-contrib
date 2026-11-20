@@ -4,6 +4,8 @@
 
 ## 一、原型现状与实测
 
+本节引用的原型源码、`RESULTS-*.md` 与 `benchmark-results-*.json` 已从目录中删除，可用 `git show 8ec24bf6ef9:experiments/tailspool/<文件名>` 查看。
+
 ### 磁盘格式与写入顺序
 
 以下对应已验证的 `compact` 原型稳态路径。目录由 backend 指定；测试机在 `/data/otel-tail-bench` 下为每轮分配独立目录。两种文件各有一个用途。
@@ -31,28 +33,28 @@
 
 **采样器此时拿到什么？** 纯状态策略的投影是每条 trace 一个状态位集合。原型每 20 ms 查看截止时间最小堆，每组最多取 256 条到期 trace。t=30 时，对 X 临时构造两条只带 X 和状态码的 span（OK、ERROR），对 Y 构造一条（OK），再调用官方 `sampler.ConsumeTraces`。官方 processor 在自己的一秒窗口内按配置求值。X 命中 ERROR，Y 未命中。t=38 后同理对 Z 求值。这里的 t=30、38 是可提交求值的时刻，实际回调时间还包括调度和官方窗口。临时构造的 span 只进入 evaluator；原型为官方 processor 配置的 next consumer 直接返回，防止将投影误作业务数据导出。
 
-若配置加了 `span_count`，上述“每种状态构造一条 span”的办法会算错数量。原型会切到逐 span 投影，保留每条输入的身份和所需字段，将各请求的小投影编码后放入 `parts`，到期再解码并拼入采样输入。若策略树需要完整上下文（例如 OTTL），待决表只挂 record 引用；到期时将同一组候选按 record 分组，按 seq 顺序读取，筛出候选 trace 后交给同一官方 processor。这条路径即使最终 drop 也有求值读盘开销。[投影分支](projection.go) · [到期组装](pending.go)
+若配置加了 `span_count`，上述“每种状态构造一条 span”的办法会算错数量。原型会切到逐 span 投影，保留每条输入的身份和所需字段，将各请求的小投影编码后放入 `parts`，到期再解码并拼入采样输入。若策略树需要完整上下文（例如 OTTL），待决表只挂 record 引用；到期时将同一组候选按 record 分组，按 seq 顺序读取，筛出候选 trace 后交给同一官方 processor。这条路径即使最终 drop 也有求值读盘开销。投影分支：`projection.go` · 到期组装：`pending.go`
 
 ### 从决定追到磁盘字节，再追到导出 span
 
 1. **收到 X 的 keep。** 官方 processor 写入 sampled decision cache，原型的 `observedCache.Put` 收到 X。它追加 `K | X` 决定帧，找到 101、102，分别把 X 加进两条记录的 keep 集合，各自 pending 从 2 减至 1。此时两个批次都还含未决 trace，导出路径暂时没有读盘。
 2. **收到 Y 的 drop。** 追加 `D | Y`。101.pending 变为 0，101.keep 为 {X}。调用段 7 的 `ReadAt(buf[:8192], 0)`，解码 A，遍历原始 span，保留 x1、删除 y1，删除由此变空的 Scope/Resource。输出中的 x1 带有原来的属性、事件、链接和所属 Resource/Scope。keep 的是 X 整条 trace，因此 x1 的状态为 OK 也会导出。X、Y 的回调顺序互换，101 的结果相同。
 3. **收到 Z 的 drop。** 102.pending 变为 0，102.keep 为 {X}。调用 `ReadAt(buf[:4096], 8192)`，解码 B，只交付 x2。两个请求合起来输出 x1、x2 各一次，下游可能分两批收到 X。同一 record 含多个 keep trace 时，一次导出回读即可取齐；keep 集合为空则直接完成。需要完整输入求值的策略可能在求值和导出两个时点分别读取同一 record。
-4. **确认与回收。** 原型调用本地校验 sink 成功后追加 `C | seq | 已提交的校验输出条数`，减少段的活跃 record 数；封闭段归零才可删除。重启时按完整 WAL 帧重建关联；尾部半帧截断，CRC 错误报错。如果已写 K/D、还没写 C，可以重做该 record；本地校验文件按最后一次 C 截断再回放。Kafka 无法用文件截断实现相同语义。[决策与读取实现](spool.go) · [恢复规则](journal.go)
+4. **确认与回收。** 原型调用本地校验 sink 成功后追加 `C | seq | 已提交的校验输出条数`，减少段的活跃 record 数；封闭段归零才可删除。重启时按完整 WAL 帧重建关联；尾部半帧截断，CRC 错误报错。如果已写 K/D、还没写 C，可以重做该 record；本地校验文件按最后一次 C 截断再回放。Kafka 无法用文件截断实现相同语义。决策与读取实现：`spool.go` · 恢复规则：`journal.go`
 
 **读盘成本的计算单位是请求。** 在上述纯状态示例里，4 个 span 只保留 2 个，但两个原始请求都含 X，导出仍要逻辑读取 12,288 字节并解码两次。估算冷盘压力应统计“至少有一条 keep trace 的请求字节数”，另外计入完整输入策略的求值读取和重启重建读取；物理读量还受页缓存和预读影响。
 
 ### 原型恢复与限制
 
-原型在 activate 接管全部 inbox 后启动 dispatch。待决窗口和 WAL 使用 UnixNano 墙钟，到期后再向官方 processor 的一秒窗口提交；attach 在原截止时间冻结投影。回读及校验 sink 同步运行于 Put 持有的 spool 锁内。状态位路径以外，逐 span 投影和完整上下文回读都会增加内存或磁盘压力。[恢复入口](online.go) · [调度](pending.go) · [交付](spool.go)
+原型在 activate 接管全部 inbox 后启动 dispatch。待决窗口和 WAL 使用 UnixNano 墙钟，到期后再向官方 processor 的一秒窗口提交；attach 在原截止时间冻结投影。回读及校验 sink 同步运行于 Put 持有的 spool 锁内。状态位路径以外，逐 span 投影和完整上下文回读都会增加内存或磁盘压力。恢复入口：`online.go` · 调度：`pending.go` · 交付：`spool.go`
 
-实验程序只接受 trace-complete。只有 `plan.full` 会把 record 持续加入 `v.raw`；相同 wait 下，求值只接收满足 `r.due - wait < v.due` 的片段。完整上下文和字节策略在原型里回读原文。启用 tracestate 预算且最终投影未携带 tracestate 时，rate_limiting 可能缺少随机值输入。K/D 及检查点缓存缺少 Threshold、PolicyName；轮转 OpenFile 失败可重试，短写、WAL、回读或 sink 错误可使 s.err 持续生效。实验 harness 为 sampled 和 non-sampled 两侧各注入容量 150,000 的 LRU，现有差分只覆盖启用缓存的配置。官方两个 cache_size 默认均为 0。历史验证也没有覆盖 span-ingest。[实验缓存注入](main.go) · [默认配置](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.1/processor/tailsamplingprocessor/factory.go) · [配置与投影](projection.go) · [回放](journal.go)
+实验程序只接受 trace-complete。只有 `plan.full` 会把 record 持续加入 `v.raw`；相同 wait 下，求值只接收满足 `r.due - wait < v.due` 的片段。完整上下文和字节策略在原型里回读原文。启用 tracestate 预算且最终投影未携带 tracestate 时，rate_limiting 可能缺少随机值输入。K/D 及检查点缓存缺少 Threshold、PolicyName；轮转 OpenFile 失败可重试，短写、WAL、回读或 sink 错误可使 s.err 持续生效。实验 harness 为 sampled 和 non-sampled 两侧各注入容量 150,000 的 LRU，现有差分只覆盖启用缓存的配置。官方两个 cache_size 默认均为 0。历史验证也没有覆盖 span-ingest。实验缓存注入：`main.go` · [默认配置](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.1/processor/tailsamplingprocessor/factory.go) · 配置与投影：`projection.go` · 回放：`journal.go`
 
 ### 实测范围
 
-- **存储路径。** 在 6,144 span/s 冷回读等载下，顺序盘稳态物理读/写约 8.9/24.5 MiB/s，TakeMany Pebble 约 51.2/75.2 MiB/s。对照使用 v0.165.1 加两项上游 TakeMany 回移。[冷盘对照](RESULTS-pressure.md)
-- **决策一致性。** 四套配置各 512 条 trace。正常与 SIGKILL 恢复各对照官方 2,048 个逐 trace 决策、1,698 个完整导出 span，差异均为零。覆盖状态、类型化属性、延迟、组合否决、同一 span 的 OTTL 条件、计数、flags、tracestate 和概率。这四组未启用上述输出修改 gate，也未在投影冻结与官方发布决定之间注入 span。[策略差分报告](RESULTS-policies.md)
-- **写入与恢复。** 仅配置 ERROR 状态位投影的版本在上述 24,576 span/s 故障档持续 155 秒，恢复 192,576 条待决 trace，无 OOM。最长无 ACK 间隔 305 ms，57 批未获 ACK；已 ACK 输入应保留的 38,024 个 span 均匹配。最大恢复决策滞后为 4.885 秒，前一版为 1.218 秒。本轮接管 143 个 inbox；192,576 是恢复时待决总量，其中已过期的条数未记录。现有指标无法把滞后退化归因于 activate，阶段 A 先采集串行基线。完整性已验证到 backend 校验 sink，LB 重发和 kill 后的重复上界由阶段 C 验收。[故障实测](benchmark-results-policies.json) · [前版恢复数据](RESULTS-online.md)
+- **存储路径。** 在 6,144 span/s 冷回读等载下，顺序盘稳态物理读/写约 8.9/24.5 MiB/s，TakeMany Pebble 约 51.2/75.2 MiB/s。对照使用 v0.165.1 加两项上游 TakeMany 回移。冷盘对照：`RESULTS-pressure.md`
+- **决策一致性。** 四套配置各 512 条 trace。正常与 SIGKILL 恢复各对照官方 2,048 个逐 trace 决策、1,698 个完整导出 span，差异均为零。覆盖状态、类型化属性、延迟、组合否决、同一 span 的 OTTL 条件、计数、flags、tracestate 和概率。这四组未启用上述输出修改 gate，也未在投影冻结与官方发布决定之间注入 span。策略差分报告：`RESULTS-policies.md`
+- **写入与恢复。** 仅配置 ERROR 状态位投影的版本在上述 24,576 span/s 故障档持续 155 秒，恢复 192,576 条待决 trace，无 OOM。最长无 ACK 间隔 305 ms，57 批未获 ACK；已 ACK 输入应保留的 38,024 个 span 均匹配。最大恢复决策滞后为 4.885 秒，前一版为 1.218 秒。本轮接管 143 个 inbox；192,576 是恢复时待决总量，其中已过期的条数未记录。现有指标无法把滞后退化归因于 activate，阶段 A 先采集串行基线。完整性已验证到 backend 校验 sink，LB 重发和 kill 后的重复上界由阶段 C 验收。故障实测：`benchmark-results-policies.json` · 前版恢复数据：`RESULTS-online.md`
 
 ## 二、生产设计与验收
 
@@ -73,9 +75,9 @@
 
 ### 接入与索引
 
-在 backend 配置专用 OTLP/gRPC traces receiver，并让它和紧邻的 tail_sampling 实例共享一个 spool。普通 `consumer.Traces` 入口只收到 pdata，已经丢失原始请求字节。专用入口应在同一次调用中把原文、解码视图交给 spool，等落盘和登记成功再结束 RPC。阶段 A 在监听 gRPC 前检查这条 traces pipeline 的实际组件顺序。专用 receiver 与对应 tail_sampling 之间出现任何 processor 就拒绝启动，错误列出 pipeline 和中间组件名，以免原文回读重新引入已过滤的 span 或已脱敏的字段。采样后的 processor 接收回读的完整数据。[原型接收入口](main.go) · [接收与登记](online.go)
+在 backend 配置专用 OTLP/gRPC traces receiver，并让它和紧邻的 tail_sampling 实例共享一个 spool。普通 `consumer.Traces` 入口只收到 pdata，已经丢失原始请求字节。专用入口应在同一次调用中把原文、解码视图交给 spool，等落盘和登记成功再结束 RPC。阶段 A 在监听 gRPC 前检查这条 traces pipeline 的实际组件顺序。专用 receiver 与对应 tail_sampling 之间出现任何 processor 就拒绝启动，错误列出 pipeline 和中间组件名，以免原文回读重新引入已过滤的 span 或已脱敏的字段。采样后的 processor 接收回读的完整数据。原型接收入口：`main.go` · 接收与登记：`online.go`
 
-**批次位置的传递。** 拟增加一个 backend 私有的登记入口，输入为批次位置、原始到达时间和按 trace 更新后的折叠状态。位置保存在 sampler 和 spool 共享的侧索引中，不写进 OTLP 属性，也不依赖跨异步边界传递 gRPC context。一条 record 持有段、offset、length、到期时间、待决 trace 数和 keep 集合。每个不同的 trace ID 在同一 record 只登记一次，`index[id]` 可引用多个 record。另用 `views[id]` 保存该 trace 的折叠状态。先追加原文，再写登记 WAL，最后发布内存索引并返回 ACK；短写或登记失败返回错误，恢复时只承认可完整回放的登记。此顺序的现有实测范围是进程 SIGKILL。[原文和双向关联](spool.go) · [登记日志](journal.go)
+**批次位置的传递。** 拟增加一个 backend 私有的登记入口，输入为批次位置、原始到达时间和按 trace 更新后的折叠状态。位置保存在 sampler 和 spool 共享的侧索引中，不写进 OTLP 属性，也不依赖跨异步边界传递 gRPC context。一条 record 持有段、offset、length、到期时间、待决 trace 数和 keep 集合。每个不同的 trace ID 在同一 record 只登记一次，`index[id]` 可引用多个 record。另用 `views[id]` 保存该 trace 的折叠状态。先追加原文，再写登记 WAL，最后发布内存索引并返回 ACK；短写或登记失败返回错误，恢复时只承认可完整回放的登记。此顺序的现有实测范围是进程 SIGKILL。原文和双向关联：`spool.go` · 登记日志：`journal.go`
 
 ### 接收与 tick 共用的终局决定
 

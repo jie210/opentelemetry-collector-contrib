@@ -192,7 +192,7 @@ spool 写盘的是 tailspool receiver 收到的原始请求字节，求值用的
 
 ### OTLP 实测复核
 
-测试机上用 `9b5b8ca1be5` 构建的 collector（otlp receiver → tail_sampling spool → otlp exporter），只配 `status_code: ERROR`，`decision_wait: 5s`，`max_unprocessed_memory: 1`，真实 ticker。探针 `bench/cmd/headprobe` 经 OTLP gRPC 依次发送 A 的普通 span、200 个填充请求（主循环积压约 0.4 s）、B、A 的 ERROR span，全部 ACK 后在 B 被读到之前清零段文件里 B 的 49 字节。每组 3 次，每次新目录：
+测试机上用 `9b5b8ca1be5` 构建的 collector（otlp receiver → tail_sampling spool → otlp exporter），只配 `status_code: ERROR`，`decision_wait: 5s`，`max_unprocessed_memory: 1`，真实 ticker。探针 `bench/cmd/headprobe`（已删除，可从 `8ec24bf6ef9` 取回）经 OTLP gRPC 依次发送 A 的普通 span、200 个填充请求（主循环积压约 0.4 s）、B、A 的 ERROR span，全部 ACK 后在 B 被读到之前清零段文件里 B 的 49 字节。每组 3 次，每次新目录：
 
 | 组 | A 截止后（+8 s） | 最终 | collector 读失败告警 |
 |---|---|---|---|
