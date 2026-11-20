@@ -63,6 +63,7 @@ func (s *Spool) Stop() error {
 	}
 	s.readyCond.Broadcast()
 	s.mu.Unlock()
+	s.writing.Wait()
 	s.workers.Wait()
 	s.background.Wait()
 

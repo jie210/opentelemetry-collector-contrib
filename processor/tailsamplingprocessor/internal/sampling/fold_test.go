@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 
@@ -243,6 +244,8 @@ func TestFoldTreeMatchesWholeTrace(t *testing.T) {
 
 func TestFoldTracesSizeMatchesBytesLimiting(t *testing.T) {
 	plan := &FoldPlan{}
+	_, err := Fold(NewBytesLimiting(componenttest.NewNopTelemetrySettings(), 1<<20), plan)
+	require.NoError(t, err)
 	r := rand.New(rand.NewPCG(3, 4))
 	for i := range 500 {
 		var id pcommon.TraceID
@@ -251,6 +254,61 @@ func TestFoldTracesSizeMatchesBytesLimiting(t *testing.T) {
 		ft := foldTrace(t, plan, id, frags)
 		want := calculateTraceSize(&samplingpolicy.TraceData{ReceivedBatches: wholeTrace(frags)})
 		require.Equal(t, want, calculateTraceSize(&samplingpolicy.TraceData{Folded: ft}))
+	}
+}
+
+func TestFoldSumsTracesSizeOnlyForBytesLimiting(t *testing.T) {
+	set := componenttest.NewNopTelemetrySettings()
+	status, err := NewStatusCodeFilter(set, []string{"ERROR"})
+	require.NoError(t, err)
+	unsized := &FoldPlan{}
+	_, err = Fold(NewAnd(zap.NewNop(), []samplingpolicy.Evaluator{status, NewProbabilisticSampler(set, "", 10)}), unsized)
+	require.NoError(t, err)
+	sized := &FoldPlan{}
+	_, err = Fold(NewAnd(zap.NewNop(), []samplingpolicy.Evaluator{status, NewBytesLimiting(set, 1<<20)}), sized)
+	require.NoError(t, err)
+
+	id := pcommon.TraceID{1}
+	frags := randomTrace(rand.New(rand.NewPCG(5, 6)), id)
+	require.Zero(t, foldTrace(t, unsized, id, frags).TracesSize)
+	require.Positive(t, foldTrace(t, sized, id, frags).TracesSize)
+}
+
+func TestFoldPrepareConcurrently(t *testing.T) {
+	plan := &FoldPlan{}
+	for _, tc := range foldLeafCases() {
+		_, err := Fold(tc.make(t), plan)
+		require.NoError(t, err)
+	}
+	_, err := Fold(NewBytesLimiting(componenttest.NewNopTelemetrySettings(), 1<<20), plan)
+	require.NoError(t, err)
+
+	r := rand.New(rand.NewPCG(9, 10))
+	ids := make([]pcommon.TraceID, 300)
+	traces := make([][]ptrace.Traces, len(ids))
+	for i := range ids {
+		ids[i][0], ids[i][15] = byte(i), byte(i>>8)
+		traces[i] = randomTrace(r, ids[i])
+	}
+	prepared := make([][]Prepared, len(ids))
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Go(func() {
+			for i := w; i < len(ids); i += 8 {
+				for _, f := range traces[i] {
+					prepared[i] = append(prepared[i], plan.Prepare(t.Context(), ids[i], f))
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	for i, id := range ids {
+		ft := plan.NewTrace()
+		for j, f := range traces[i] {
+			plan.AddPrepared(ft, f, prepared[i][j])
+		}
+		require.Equal(t, foldTrace(t, plan, id, traces[i]), ft, "trace %d", i)
 	}
 }
 

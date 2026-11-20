@@ -42,9 +42,21 @@ func (s *spanSink) ConsumeTraces(_ context.Context, td ptrace.Traces) error {
 // keepTrace is the model sampler's decision.
 func keepTrace(id pcommon.TraceID) bool { return id[0]%2 == 0 }
 
+// instances holds the pending instance of each trace, as the processor does.
+type instances map[pcommon.TraceID]*Pending
+
+func (in instances) of(id pcommon.TraceID) *Pending {
+	p, ok := in[id]
+	if !ok {
+		p = &Pending{}
+		in[id] = p
+	}
+	return p
+}
+
 type modelSampler struct {
 	s       *Spool
-	pending map[pcommon.TraceID]bool
+	pending instances
 	decided map[pcommon.TraceID]bool
 }
 
@@ -64,16 +76,15 @@ func (m *modelSampler) process(r *Record, idxs []int) {
 			m.s.Inherit(r, i, keep)
 			continue
 		}
-		m.s.Attach(r, i)
-		m.pending[id] = true
+		m.s.Attach(m.pending.of(id), r, i)
 	}
 	m.s.End(r)
 }
 
 func (m *modelSampler) tick(r *rand.Rand) {
-	for id := range m.pending {
+	for id, p := range m.pending {
 		if r.IntN(3) == 0 {
-			m.s.Decide(id, keepTrace(id))
+			m.s.Decide(p, id, keepTrace(id))
 			m.decided[id] = keepTrace(id)
 			delete(m.pending, id)
 		}
@@ -146,7 +157,7 @@ func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
 		open := func() (*Spool, *modelSampler) {
 			s, rec, err := Open(testConfig(dir), zap.NewNop(), sink)
 			require.NoError(t, err)
-			m := &modelSampler{s: s, pending: map[pcommon.TraceID]bool{}, decided: map[pcommon.TraceID]bool{}}
+			m := &modelSampler{s: s, pending: instances{}, decided: map[pcommon.TraceID]bool{}}
 			for _, e := range rec.Memo {
 				m.decided[e.ID] = e.Keep
 			}
@@ -188,8 +199,8 @@ func TestSpoolCrashRecoveryDeliversKeptSpans(t *testing.T) {
 				s, m = open()
 			}
 		}
-		for id := range m.pending {
-			s.Decide(id, keepTrace(id))
+		for id, p := range m.pending {
+			s.Decide(p, id, keepTrace(id))
 		}
 		require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 10*time.Second, 5*time.Millisecond)
 		require.NoError(t, s.Stop())
@@ -244,7 +255,7 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 		sink := &spanSink{spans: map[pcommon.SpanID]int{}}
 		s, _, err := Open(cfg, zap.NewNop(), sink)
 		require.NoError(t, err)
-		m := &modelSampler{s: s, pending: map[pcommon.TraceID]bool{}, decided: map[pcommon.TraceID]bool{}}
+		m := &modelSampler{s: s, pending: instances{}, decided: map[pcommon.TraceID]bool{}}
 
 		// process handles a record like the processor does, with capacity
 		// evictions and size-limit drops in the middle of the record.
@@ -253,8 +264,8 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 			for _, i := range idxs {
 				id := rec.assocs[i].ID
 				if r.IntN(8) == 0 && len(m.pending) > 0 {
-					for victim := range m.pending {
-						s.Evict(victim)
+					for victim, p := range m.pending {
+						s.Evict(p, victim)
 						delete(m.pending, victim)
 						break
 					}
@@ -263,10 +274,9 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 					s.Inherit(rec, i, keep)
 					continue
 				}
-				s.Attach(rec, i)
-				m.pending[id] = true
+				s.Attach(m.pending.of(id), rec, i)
 				if r.IntN(10) == 0 {
-					s.Decide(id, false)
+					s.Decide(m.pending[id], id, false)
 					m.decided[id] = false
 					delete(m.pending, id)
 				}
@@ -309,7 +319,7 @@ func TestReplayMatchesRuntimeState(t *testing.T) {
 				require.Equal(t, wantStates, gotStates, "seed %d step %d", seed, step)
 				require.Equal(t, wantMemo, gotMemo, "seed %d step %d", seed, step)
 
-				m = &modelSampler{s: s, pending: map[pcommon.TraceID]bool{}, decided: map[pcommon.TraceID]bool{}}
+				m = &modelSampler{s: s, pending: instances{}, decided: map[pcommon.TraceID]bool{}}
 				for _, e := range got.Memo {
 					m.decided[e.ID] = e.Keep
 				}
@@ -392,7 +402,7 @@ func TestSpoolIgnoresTornTail(t *testing.T) {
 	rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 	require.NoError(t, err)
 	s.Begin(rec)
-	s.Attach(rec, 0)
+	s.Attach(&Pending{}, rec, 0)
 	s.Flush()
 	crash(s)
 
@@ -408,12 +418,13 @@ func TestSpoolIgnoresTornTail(t *testing.T) {
 	require.Equal(t, rec.Seq(), got.Refeed[0].Record.Seq())
 	s.Start()
 	require.Len(t, got.Refeed[0].Assocs, len(ids))
+	var p Pending
 	s.Begin(got.Refeed[0].Record)
 	for _, i := range got.Refeed[0].Assocs {
-		s.Attach(got.Refeed[0].Record, i)
+		s.Attach(&p, got.Refeed[0].Record, i)
 	}
 	s.End(got.Refeed[0].Record)
-	s.Decide(pcommon.TraceID{4}, true)
+	s.Decide(&p, pcommon.TraceID{4}, true)
 	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, 5*time.Millisecond)
 	require.NoError(t, s.Stop())
 	require.Len(t, sink.spans, td.SpanCount())

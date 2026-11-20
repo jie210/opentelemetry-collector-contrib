@@ -93,11 +93,21 @@ func (tsp *tailSamplingSpanProcessor) consumeSpooled(ctx context.Context, td ptr
 		for _, b := range splitResourceSpansByTrace(rss, true) {
 			b.idx = len(assocs)
 			assocs = append(assocs, spool.Assoc{ID: b.id, Resource: uint32(ri)})
-			batches = append(batches, b)
+			batches = append(batches, tsp.prepareFragment(b))
 		}
 	}
 	_, err = tsp.spool.Register(ctx, data, assocs, time.Now(), batches)
 	return err
+}
+
+// prepareFragment moves the fragment into the Traces it is folded as and
+// evaluates the policies on it, before it reaches the loop.
+func (tsp *tailSamplingSpanProcessor) prepareFragment(b traceBatch) traceBatch {
+	b.frag = ptrace.NewTraces()
+	appendToTraces(b.frag, b.rss)
+	b.rss = b.frag.ResourceSpans().At(0)
+	b.pre = tsp.foldPlan.Prepare(tsp.ctx, b.id, b.frag)
+	return b
 }
 
 // processNextSpooled processes the oldest registered record not processed
@@ -112,7 +122,7 @@ func (tsp *tailSamplingSpanProcessor) processNextSpooled(tickChan <-chan time.Ti
 
 // spooledFragments splits a stored request into the fragments of the open
 // associations, indexed by association.
-func spooledFragments(td ptrace.Traces, open map[spool.Assoc]int) []traceBatch {
+func (tsp *tailSamplingSpanProcessor) spooledFragments(td ptrace.Traces, open map[spool.Assoc]int) []traceBatch {
 	var batch []traceBatch
 	for ri, rss := range td.ResourceSpans().All() {
 		for _, b := range splitResourceSpansByTrace(rss, true) {
@@ -121,7 +131,7 @@ func spooledFragments(td ptrace.Traces, open map[spool.Assoc]int) []traceBatch {
 				continue
 			}
 			b.idx = idx
-			batch = append(batch, b)
+			batch = append(batch, tsp.prepareFragment(b))
 		}
 	}
 	return batch
@@ -163,7 +173,9 @@ func (tsp *tailSamplingSpanProcessor) processSpooledTrace(b traceBatch, arrival 
 	id := b.id
 	var newTraceIDs int64
 	defer func() {
-		tsp.telemetry.ProcessorTailSamplingNewTraceIDReceived.Add(tsp.ctx, newTraceIDs)
+		if newTraceIDs > 0 {
+			tsp.telemetry.ProcessorTailSamplingNewTraceIDReceived.Add(tsp.ctx, newTraceIDs)
+		}
 	}()
 
 	actualData, ok := tsp.idToTrace[id]
@@ -212,18 +224,16 @@ func (tsp *tailSamplingSpanProcessor) processSpooledTrace(b traceBatch, arrival 
 		actualData.FinalDecision = samplingpolicy.NotSampled
 		actualData.Folded = nil
 		tsp.decisionBatcher.RemoveFromBatch(id, actualData.batchID)
-		tsp.spool.Attach(b.rec, b.idx)
-		tsp.spool.Decide(id, false)
+		tsp.spool.Attach(&actualData.spooled, b.rec, b.idx)
+		tsp.spool.Decide(&actualData.spooled, id, false)
 		tsp.releaseNotSampledTrace(id, actualData)
 		return
 	}
 
 	switch finalDecision {
 	case samplingpolicy.Unspecified:
-		frag := ptrace.NewTraces()
-		appendToTraces(frag, b.rss)
-		tsp.foldPlan.Add(tsp.ctx, id, actualData.Folded, frag)
-		tsp.spool.Attach(b.rec, b.idx)
+		tsp.foldPlan.AddPrepared(actualData.Folded, b.frag, b.pre)
+		tsp.spool.Attach(&actualData.spooled, b.rec, b.idx)
 		return
 	case samplingpolicy.Sampled:
 		tsp.spool.Inherit(b.rec, b.idx, true)
@@ -280,7 +290,7 @@ func (tsp *tailSamplingSpanProcessor) restoreSpool(recovered *spool.Recovered, t
 		for _, idx := range rr.Assocs {
 			open[rr.Record.Assocs()[idx]] = idx
 		}
-		batch := spooledFragments(td, open)
+		batch := tsp.spooledFragments(td, open)
 		if len(batch) == 0 {
 			continue
 		}

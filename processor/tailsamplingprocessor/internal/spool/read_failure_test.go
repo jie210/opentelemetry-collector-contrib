@@ -56,12 +56,13 @@ func registerKept(t *testing.T, s *Spool, count int) (spans int) {
 		require.NoError(t, err)
 		rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 		require.NoError(t, err)
+		var p Pending
 		s.Begin(rec)
 		for j := range ids {
-			s.Attach(rec, j)
+			s.Attach(&p, rec, j)
 		}
 		s.End(rec)
-		s.Decide(id, true)
+		s.Decide(&p, id, true)
 		spans += td.SpanCount()
 	}
 	s.Flush()
@@ -124,6 +125,7 @@ func TestReadRecoveredReleasesUnreadableRecord(t *testing.T) {
 	require.NoError(t, err)
 	r := rand.New(rand.NewPCG(7, 8))
 	var next uint64
+	var p Pending
 	for range 2 {
 		td, ids := makeRequest(r, []pcommon.TraceID{{4}}, &next)
 		var u ptrace.ProtoMarshaler
@@ -132,7 +134,7 @@ func TestReadRecoveredReleasesUnreadableRecord(t *testing.T) {
 		rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 		require.NoError(t, err)
 		s.Begin(rec)
-		s.Attach(rec, 0)
+		s.Attach(&p, rec, 0)
 		s.End(rec)
 	}
 	s.Flush()
@@ -185,10 +187,11 @@ func TestUndecodableRecordIsReleasedAtDelivery(t *testing.T) {
 	raw, ids := deepRequest(t, id)
 	rec, err := s.Register(context.Background(), raw, ids, time.Now(), nil)
 	require.NoError(t, err)
+	var p Pending
 	s.Begin(rec)
-	s.Attach(rec, 0)
+	s.Attach(&p, rec, 0)
 	s.End(rec)
-	s.Decide(id, true)
+	s.Decide(&p, id, true)
 	spans := registerKept(t, s, 1)
 
 	require.Eventually(t, func() bool { return s.Stats().LiveRecords == 0 }, 5*time.Second, time.Millisecond)
@@ -224,7 +227,7 @@ func TestReadRecoveredReleasesUndecodableRecordAtOnce(t *testing.T) {
 		rec, err := s.Register(context.Background(), req.raw, req.ids, time.Now(), nil)
 		require.NoError(t, err)
 		s.Begin(rec)
-		s.Attach(rec, 0)
+		s.Attach(&Pending{}, rec, 0)
 		s.End(rec)
 	}
 	s.Flush()
@@ -253,6 +256,7 @@ func TestOpenReleasesRecordsOfDamagedSegments(t *testing.T) {
 	r := rand.New(rand.NewPCG(9, 10))
 	var next uint64
 	segOf := map[uint64]uint32{}
+	pending := instances{}
 	for range 60 {
 		td, ids := makeRequest(r, []pcommon.TraceID{{6}, {8}}, &next)
 		var u ptrace.ProtoMarshaler
@@ -262,8 +266,8 @@ func TestOpenReleasesRecordsOfDamagedSegments(t *testing.T) {
 		require.NoError(t, err)
 		segOf[rec.Seq()] = rec.seg.id
 		s.Begin(rec)
-		for i := range ids {
-			s.Attach(rec, i)
+		for i, a := range ids {
+			s.Attach(pending.of(a.ID), rec, i)
 		}
 		s.End(rec)
 	}

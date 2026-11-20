@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,6 +139,112 @@ func TestRegisterWaitsForRoom(t *testing.T) {
 	require.NoError(t, s.Stop())
 }
 
+// holdFirstWrite makes the first write into a segment wait until release is
+// closed, and closes the returned channel once it waits.
+func holdFirstWrite(s *Spool, release <-chan struct{}) <-chan struct{} {
+	entered := make(chan struct{})
+	var held atomic.Bool
+	s.writeAt = func(seg *segment, buf []byte, off int64) (int, error) {
+		if held.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+		return writeSegment(seg, buf, off)
+	}
+	return entered
+}
+
+func TestRegisterWritesOutsideTheLock(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.SyncOnRotate = true
+	r := rand.New(rand.NewPCG(5, 5))
+	var next uint64
+	a := newTestRequest(t, r, &next, pcommon.TraceID{1})
+	b := newTestRequest(t, r, &next, pcommon.TraceID{2})
+	// Each request starts a new segment.
+	cfg.SegmentBytes = int64(len(a.raw))
+	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	release := make(chan struct{})
+	entered := holdFirstWrite(s, release)
+	first := s.active
+
+	registered := make(chan error, 1)
+	go func() {
+		_, err := a.register(s, context.Background(), nil)
+		registered <- err
+	}()
+	<-entered
+
+	// Another request is registered while the first is being written, and
+	// seals the segment the first is writing into.
+	rb, err := b.register(s, context.Background(), nil)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rb.Seq())
+	require.NotSame(t, first, rb.seg)
+	s.mu.Lock()
+	require.True(t, first.needSync, "a sealed segment is synced once its writes are done")
+	require.False(t, first.syncing)
+	require.Same(t, first, s.segs[first.id])
+	s.mu.Unlock()
+
+	close(release)
+	require.NoError(t, <-registered)
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !first.needSync && !first.syncing
+	}, 5*time.Second, time.Millisecond)
+	require.NoError(t, s.Stop())
+
+	s, got, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	require.Len(t, got.Refeed, 2)
+	for i, want := range []testRequest{b, a} {
+		rec := got.Refeed[i].Record
+		require.EqualValues(t, i+1, rec.Seq())
+		td, err := s.ReadRecovered(rec)
+		require.NoError(t, err)
+		require.Equal(t, want.spans, td.SpanCount())
+	}
+	require.NoError(t, s.Stop())
+}
+
+func TestStopWaitsForWrites(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	r := rand.New(rand.NewPCG(6, 6))
+	var next uint64
+	req := newTestRequest(t, r, &next, pcommon.TraceID{1})
+	s, _, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	release := make(chan struct{})
+	entered := holdFirstWrite(s, release)
+
+	registered := make(chan error, 1)
+	go func() {
+		_, err := req.register(s, context.Background(), nil)
+		registered <- err
+	}()
+	<-entered
+	stopped := make(chan error, 1)
+	go func() { stopped <- s.Stop() }()
+	select {
+	case err := <-stopped:
+		require.FailNow(t, "stopped while a request was being written", "%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The request is refused, as it was not registered before stopping.
+	close(release)
+	require.ErrorIs(t, <-registered, errStopped)
+	require.NoError(t, <-stopped)
+
+	s, got, err := Open(cfg, zap.NewNop(), &spanSink{spans: map[pcommon.SpanID]int{}})
+	require.NoError(t, err)
+	require.Empty(t, got.Refeed)
+	require.NoError(t, s.Stop())
+}
+
 func TestRegisterChecksFreeDisk(t *testing.T) {
 	if !slices.Contains([]string{"darwin", "freebsd", "linux"}, runtime.GOOS) {
 		t.Skip("free disk space is not checked")
@@ -223,7 +330,7 @@ func TestCheckpointKeepsFramesWrittenMeanwhile(t *testing.T) {
 				<-release
 			})
 		}
-		m := &modelSampler{s: s, pending: map[pcommon.TraceID]bool{}, decided: map[pcommon.TraceID]bool{}}
+		m := &modelSampler{s: s, pending: instances{}, decided: map[pcommon.TraceID]bool{}}
 		traces := make([]pcommon.TraceID, 10)
 		for i := range traces {
 			traces[i][0] = byte(i)

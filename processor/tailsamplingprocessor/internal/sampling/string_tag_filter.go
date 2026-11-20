@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sync"
 
 	"github.com/golang/groupcache/lru"
 	"go.opentelemetry.io/collector/component"
@@ -29,6 +30,9 @@ type stringAttributeFilter struct {
 }
 
 type regexStrSetting struct {
+	// mu guards matchedAttrs, as the tail spool evaluates fragments
+	// concurrently.
+	mu           sync.Mutex
 	matchedAttrs *lru.Cache
 	filterList   []*regexp.Regexp
 }
@@ -57,19 +61,25 @@ func NewStringAttributeFilter(settings component.TelemetrySettings, key string, 
 			logger: settings.Logger,
 			// matcher returns true if the given string matches the regex rules defined in string attribute filters
 			matcher: func(toMatch string) bool {
-				if v, ok := regexStrSetting.matchedAttrs.Get(toMatch); ok {
+				regexStrSetting.mu.Lock()
+				v, ok := regexStrSetting.matchedAttrs.Get(toMatch)
+				regexStrSetting.mu.Unlock()
+				if ok {
 					return v.(bool)
 				}
 
+				matched := false
 				for _, r := range regexStrSetting.filterList {
 					if r.MatchString(toMatch) {
-						regexStrSetting.matchedAttrs.Add(toMatch, true)
-						return true
+						matched = true
+						break
 					}
 				}
 
-				regexStrSetting.matchedAttrs.Add(toMatch, false)
-				return false
+				regexStrSetting.mu.Lock()
+				regexStrSetting.matchedAttrs.Add(toMatch, matched)
+				regexStrSetting.mu.Unlock()
+				return matched
 			},
 			invertMatch: invertMatch,
 		}, nil

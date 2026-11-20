@@ -23,8 +23,13 @@ import (
 // its own in the same order and keeping the first result that differs from
 // the empty-trace result therefore reproduces the whole-trace verdict.
 // Latency carries running bounds across spans and is folded explicitly.
+//
+// The other leaves evaluate fragments in Prepare, which receivers call
+// concurrently, so they must be safe for concurrent use.
 type FoldPlan struct {
 	leaves []*foldLeaf
+	// sized is set when a policy reads FoldedTrace.TracesSize.
+	sized bool
 }
 
 // Len returns the number of folded leaves.
@@ -39,12 +44,48 @@ func (p *FoldPlan) NewTrace() *samplingpolicy.FoldedTrace {
 	return ft
 }
 
+// Prepared holds what a fragment yields on its own, before it is folded into
+// its trace.
+type Prepared struct {
+	size int64
+	// verdicts holds each leaf's verdict on the fragment, except latency's.
+	verdicts []leafVerdict
+}
+
+type leafVerdict struct {
+	decision samplingpolicy.Decision
+	err      error
+}
+
+// Prepare evaluates the leaves on the fragment, so that the receivers do this
+// work concurrently and AddPrepared only merges the verdicts. frag must hold
+// the spans of a single trace.
+func (p *FoldPlan) Prepare(ctx context.Context, id pcommon.TraceID, frag ptrace.Traces) Prepared {
+	pre := Prepared{verdicts: make([]leafVerdict, len(p.leaves))}
+	if p.sized {
+		var sizer ptrace.ProtoMarshaler
+		pre.size = int64(sizer.TracesSize(frag))
+	}
+	td := &samplingpolicy.TraceData{ReceivedBatches: frag}
+	for i, l := range p.leaves {
+		if l.latency == nil {
+			v := &pre.verdicts[i]
+			v.decision, v.err = l.inner.Evaluate(ctx, id, td)
+		}
+	}
+	return pre
+}
+
 // Add folds one fragment of the trace. frag must hold the spans of a single
 // trace, in the order the official processor appends them to ReceivedBatches.
 func (p *FoldPlan) Add(ctx context.Context, id pcommon.TraceID, ft *samplingpolicy.FoldedTrace, frag ptrace.Traces) {
-	var sizer ptrace.ProtoMarshaler
-	ft.TracesSize += int64(sizer.TracesSize(frag))
-	var td *samplingpolicy.TraceData
+	p.AddPrepared(ft, frag, p.Prepare(ctx, id, frag))
+}
+
+// AddPrepared folds one fragment of the trace, as Add does, with what Prepare
+// returned for it.
+func (p *FoldPlan) AddPrepared(ft *samplingpolicy.FoldedTrace, frag ptrace.Traces, pre Prepared) {
+	ft.TracesSize += pre.size
 	for i, l := range p.leaves {
 		st := &ft.Leaves[i]
 		if st.Done {
@@ -54,12 +95,8 @@ func (p *FoldPlan) Add(ctx context.Context, id pcommon.TraceID, ft *samplingpoli
 			l.latency.fold(st, frag)
 			continue
 		}
-		if td == nil {
-			td = &samplingpolicy.TraceData{ReceivedBatches: frag}
-		}
-		d, err := l.inner.Evaluate(ctx, id, td)
-		if err != nil || d != l.empty {
-			st.Decision, st.Err, st.Done = d, err, true
+		if v := pre.verdicts[i]; v.err != nil || v.decision != l.empty {
+			st.Decision, st.Err, st.Done = v.decision, v.err, true
 		}
 	}
 }
@@ -140,7 +177,10 @@ func Fold(e samplingpolicy.Evaluator, plan *FoldPlan) (samplingpolicy.Evaluator,
 		return e, nil
 	case *budgetLimiter:
 		return nil, fmt.Errorf("tracestate-based budget limiting is not supported by the tail spool")
-	case *alwaysSample, *spanCount, *rateLimiting, *bytesLimiting:
+	case *bytesLimiting:
+		plan.sized = true
+		return e, nil
+	case *alwaysSample, *spanCount, *rateLimiting:
 		return e, nil
 	default:
 		return nil, fmt.Errorf("policy evaluator %T is not supported by the tail spool", e)

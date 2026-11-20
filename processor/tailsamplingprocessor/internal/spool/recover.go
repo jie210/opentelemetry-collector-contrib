@@ -21,11 +21,16 @@ import (
 )
 
 type segment struct {
-	id      uint32
-	f       *os.File
-	size    int64
-	refs    int
-	syncing bool
+	id uint32
+	f  *os.File
+	// size includes the space reserved by writes still in progress.
+	size int64
+	refs int
+	// writers counts Register calls writing into the segment outside the
+	// lock. A sealed segment is synced and removed only once they are done.
+	writers  int
+	needSync bool
+	syncing  bool
 }
 
 func readSegment(seg *segment, buf []byte, off int64) (int, error) {
@@ -33,6 +38,10 @@ func readSegment(seg *segment, buf []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("segment %d is missing", seg.id)
 	}
 	return seg.f.ReadAt(buf, off)
+}
+
+func writeSegment(seg *segment, buf []byte, off int64) (int, error) {
+	return seg.f.WriteAt(buf, off)
 }
 
 func segmentPath(dir string, id uint32) string {
@@ -64,15 +73,27 @@ func (s *Spool) rotate() error {
 		return fmt.Errorf("segment %d already has data", seg.id)
 	}
 	s.active = seg
-	if s.cfg.SyncOnRotate {
-		old.syncing = true
-		s.background.Add(1)
-		go s.syncSegment(old)
-	}
-	if old.refs == 0 {
-		s.removeSegmentLocked(old)
-	}
+	old.needSync = s.cfg.SyncOnRotate
+	s.sealedLocked(old)
 	return nil
+}
+
+// sealedLocked syncs a sealed segment once no write is in progress, or
+// removes it if nothing references it.
+func (s *Spool) sealedLocked(seg *segment) {
+	if seg.writers > 0 {
+		return
+	}
+	if seg.needSync {
+		seg.needSync = false
+		seg.syncing = true
+		s.background.Add(1)
+		go s.syncSegment(seg)
+		return
+	}
+	if seg.refs == 0 && s.segs[seg.id] == seg {
+		s.removeSegmentLocked(seg)
+	}
 }
 
 // syncSegment fsyncs a sealed segment, which is no longer written.
@@ -91,8 +112,9 @@ func (s *Spool) syncSegment(seg *segment) {
 }
 
 func (s *Spool) removeSegmentLocked(seg *segment) {
-	// syncSegment removes it once done.
-	if seg.syncing {
+	// syncSegment, or the last write through sealedLocked, removes it once
+	// done.
+	if seg.syncing || seg.writers > 0 {
 		return
 	}
 	// The commits that released the segment must reach the file first, or a
@@ -153,7 +175,6 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 		next:    next,
 		segs:    map[uint32]*segment{},
 		records: map[uint64]*Record{},
-		pending: map[pcommon.TraceID][]assocRef{},
 		memo:    newMemo(cfg.KeepMemo, cfg.DropMemo),
 		nextSeq: 1,
 		wake:    make(chan struct{}, 1),
@@ -161,6 +182,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 
 		retryTimers: map[*time.Timer]struct{}{},
 		readAt:      readSegment,
+		writeAt:     writeSegment,
 	}
 	if cfg.MaxUnprocessed > 0 {
 		s.room = make(chan struct{}, cfg.MaxUnprocessed)
@@ -171,7 +193,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 	if err != nil {
 		return nil, nil, err
 	}
-	rp := &replay{s: s}
+	rp := &replay{s: s, pending: map[pcommon.TraceID]*Pending{}}
 	end, err := readLog(f, rp.apply)
 	if err != nil {
 		f.Close()
@@ -187,7 +209,7 @@ func Open(cfg Config, logger *zap.Logger, next consumer.Traces) (*Spool, *Recove
 	}
 	s.log = newLogWriter(f, end)
 
-	rec, err := s.finishReplay()
+	rec, err := s.finishReplay(rp.pending)
 	if err != nil {
 		f.Close()
 		return nil, nil, err
@@ -200,10 +222,19 @@ type replay struct {
 	s     *Spool
 	order []*Record
 	swept int
+	// pending holds the instance of each trace as the log rebuilds it.
+	pending map[pcommon.TraceID]*Pending
 }
 
 func (rp *replay) record(seq uint64) *Record {
 	return rp.s.records[seq]
+}
+
+func (rp *replay) settle(id pcommon.TraceID, keep bool) {
+	if p, ok := rp.pending[id]; ok {
+		delete(rp.pending, id)
+		rp.s.settlePendingLocked(p, keep)
+	}
 }
 
 func (rp *replay) apply(f frame) error {
@@ -232,11 +263,11 @@ func (rp *replay) apply(f frame) error {
 	case frameKeep, frameDrop:
 		rp.sweep(f.seq)
 		s.memo.put(f.id, f.kind == frameKeep)
-		s.settlePendingLocked(f.id, f.kind == frameKeep)
+		rp.settle(f.id, f.kind == frameKeep)
 	case frameEvict:
 		rp.sweep(f.seq)
 		s.memo.remove(f.id)
-		s.settlePendingLocked(f.id, false)
+		rp.settle(f.id, false)
 	case frameLate:
 		r := rp.record(f.seq)
 		if r == nil {
@@ -248,11 +279,11 @@ func (rp *replay) apply(f frame) error {
 		}
 		if r.state[i] == pending {
 			id := r.assocs[i].ID
-			refs := slices.DeleteFunc(s.pending[id], func(ref assocRef) bool { return ref.rec == r && ref.idx == i })
-			if len(refs) == 0 {
-				delete(s.pending, id)
-			} else {
-				s.pending[id] = refs
+			p := rp.pending[id]
+			p.refs = slices.DeleteFunc(p.refs, func(ref assocRef) bool { return ref.rec == r && ref.idx == i })
+			if len(p.refs) == 0 {
+				delete(rp.pending, id)
+				s.pendingTraces--
 			}
 			r.state[i] = unsettled
 		}
@@ -282,23 +313,28 @@ func (rp *replay) sweep(wm uint64) {
 			continue
 		}
 		for i, a := range r.assocs {
-			if r.state[i] == unsettled {
-				r.state[i] = pending
-				s.pending[a.ID] = append(s.pending[a.ID], assocRef{rec: r, idx: i})
+			if r.state[i] != unsettled {
+				continue
 			}
+			p, ok := rp.pending[a.ID]
+			if !ok {
+				p = &Pending{}
+				rp.pending[a.ID] = p
+			}
+			s.attachLocked(p, r, i)
 		}
 	}
 }
 
 // finishReplay reopens segments, removes unreferenced files, and prepares
 // the records that must be processed again.
-func (s *Spool) finishReplay() (*Recovered, error) {
+func (s *Spool) finishReplay(instances map[pcommon.TraceID]*Pending) (*Recovered, error) {
 	// A trace with associations attached after its last logged decision was
 	// a new instance at runtime, so its old decision was no longer cached.
-	for id := range s.pending {
+	for id := range instances {
 		s.memo.remove(id)
 	}
-	s.pending = map[pcommon.TraceID][]assocRef{}
+	s.pendingTraces = 0
 	s.stats.Committed = 0
 
 	for id, seg := range s.segs {

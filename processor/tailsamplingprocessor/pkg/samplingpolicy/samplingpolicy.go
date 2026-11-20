@@ -31,7 +31,8 @@ type FoldedTrace struct {
 	// Leaves holds one entry per folded leaf policy, in policy tree order.
 	Leaves []FoldedLeaf
 	// TracesSize is the sum over received fragments of the protobuf size of
-	// each fragment wrapped in its own Traces message.
+	// each fragment wrapped in its own Traces message. It is only summed
+	// when a bytes_limiting policy reads it.
 	TracesSize int64
 }
 

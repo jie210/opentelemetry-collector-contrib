@@ -117,6 +117,14 @@ type assocRef struct {
 	idx int
 }
 
+// Pending holds the associations attached to one undecided instance of a
+// trace. The processor keeps one with each instance and passes it to Attach,
+// Decide and Evict, which use it under the spool's lock. The zero value is
+// empty.
+type Pending struct {
+	refs []assocRef
+}
+
 // Spool is safe for concurrent use. Register is called by receivers; Attach,
 // Inherit, Decide, Evict and Processed are called by the processor's loop.
 type Spool struct {
@@ -133,9 +141,10 @@ type Spool struct {
 	records map[uint64]*Record
 	nextSeq uint64
 	wm      uint64
-	pending map[pcommon.TraceID][]assocRef
-	memo    *memo
-	err     error
+	// pendingTraces counts the instances holding associations.
+	pendingTraces int
+	memo          *memo
+	err           error
 
 	// unprocessed holds registered records in sequence order until the
 	// processor begins them; wake signals that it is not empty. room holds
@@ -153,6 +162,8 @@ type Spool struct {
 	lastSnapshot  int64
 	// background tracks checkpoint and segment sync goroutines.
 	background sync.WaitGroup
+	// writing tracks Register calls writing a request outside the lock.
+	writing sync.WaitGroup
 
 	ready       []*Record
 	readyCond   *sync.Cond
@@ -165,6 +176,8 @@ type Spool struct {
 
 	// readAt reads stored request bytes; tests replace it to inject faults.
 	readAt func(seg *segment, buf []byte, off int64) (int, error)
+	// writeAt writes request bytes into reserved segment space.
+	writeAt func(seg *segment, buf []byte, off int64) (int, error)
 	// snapshotWritten, if set, runs after a checkpoint's snapshot is written
 	// and before it replaces the log; tests use it to hold the checkpoint.
 	snapshotWritten func()
@@ -215,45 +228,54 @@ func (s *Spool) fail(err error) error {
 // be acknowledged once Register returns without error; it returns ctx's error
 // without writing anything if ctx is done by the time the record would be
 // written.
+//
+// The bytes are written outside the lock into space reserved for them, so
+// the processor is not held up by the write. Records are numbered once
+// written, in the order they are registered in the log.
 func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arrival time.Time, payload any) (*Record, error) {
 	if err := s.waitForRoom(ctx); err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	seg, off, err := s.reserveLocked(ctx, int64(len(raw)))
+	if err != nil {
+		s.freeRoomLocked()
+		s.mu.Unlock()
+		return nil, err
+	}
+	s.mu.Unlock()
+
+	n, err := s.writeAt(seg, raw, off)
+	if err == nil && n != len(raw) {
+		err = fmt.Errorf("short write of %d/%d bytes", n, len(raw))
+	}
+
+	state := make([]assocState, len(assocs))
 	queued := false
 	s.mu.Lock()
 	defer func() {
 		if !queued {
 			s.freeRoomLocked()
 		}
+		s.wroteLocked(seg)
 		s.mu.Unlock()
+		if queued {
+			// Poked once the lock is free, the processor need not wait for it.
+			s.poke()
+		}
 	}()
+	if err != nil {
+		return nil, s.fail(fmt.Errorf("append to segment %d: %w", seg.id, err))
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
 	if s.stopping {
 		return nil, errStopped
 	}
-	if s.active.size > 0 && s.active.size+int64(len(raw)) > s.cfg.SegmentBytes {
-		if err := s.rotate(); err != nil {
-			return nil, s.fail(err)
-		}
-	}
-	if err := s.admitLocked(ctx); err != nil {
-		return nil, err
-	}
-	seg := s.active
-	off := seg.size
-	n, err := seg.f.Write(raw)
-	seg.size += int64(n)
-	if err == nil && n != len(raw) {
-		err = fmt.Errorf("short write of %d/%d bytes", n, len(raw))
-	}
-	if err != nil {
-		return nil, s.fail(fmt.Errorf("append to segment %d: %w", seg.id, err))
-	}
 	r := &Record{
 		seq: s.nextSeq, seg: seg, off: off, length: uint32(len(raw)), arrival: arrival.UnixNano(),
-		assocs: assocs, state: make([]assocState, len(assocs)), open: len(assocs),
+		assocs: assocs, state: state, open: len(assocs),
 	}
 	s.nextSeq++
 	if err := s.log.append(&frame{kind: frameRecord, seq: r.seq, seg: seg.id, off: off, length: r.length, arrival: r.arrival, assocs: assocs}); err != nil {
@@ -272,10 +294,43 @@ func (s *Spool) Register(ctx context.Context, raw []byte, assocs []Assoc, arriva
 		r.payload = payload
 		s.unprocessed = append(s.unprocessed, r)
 		queued = true
-		s.pokeLocked()
 	}
 	s.maybeCheckpointLocked()
 	return r, nil
+}
+
+// reserveLocked checks that a request of n bytes may be written and
+// reserves space for it in the active segment.
+func (s *Spool) reserveLocked(ctx context.Context, n int64) (*segment, int64, error) {
+	if s.err != nil {
+		return nil, 0, s.err
+	}
+	if s.stopping {
+		return nil, 0, errStopped
+	}
+	if s.active.size > 0 && s.active.size+n > s.cfg.SegmentBytes {
+		if err := s.rotate(); err != nil {
+			return nil, 0, s.fail(err)
+		}
+	}
+	if err := s.admitLocked(ctx); err != nil {
+		return nil, 0, err
+	}
+	seg := s.active
+	off := seg.size
+	seg.size += n
+	seg.writers++
+	s.writing.Add(1)
+	return seg, off, nil
+}
+
+// wroteLocked ends a write reserved by reserveLocked.
+func (s *Spool) wroteLocked(seg *segment) {
+	seg.writers--
+	s.writing.Done()
+	if seg != s.active {
+		s.sealedLocked(seg)
+	}
 }
 
 // waitForRoom takes a token of room, waiting while it is full, as the
@@ -347,13 +402,9 @@ func (s *Spool) freeDiskLocked() int64 {
 func (s *Spool) Wake() <-chan struct{} { return s.wake }
 
 // Poke makes Wake ready, so a processor that postponed a record retries it.
-func (s *Spool) Poke() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pokeLocked()
-}
+func (s *Spool) Poke() { s.poke() }
 
-func (s *Spool) pokeLocked() {
+func (s *Spool) poke() {
 	select {
 	case s.wake <- struct{}{}:
 	default:
@@ -372,16 +423,22 @@ func (s *Spool) Next() (*Record, any, bool) {
 	return r, r.payload, true
 }
 
-// Attach adds the record's association i to the trace's pending instance.
-func (s *Spool) Attach(r *Record, i int) {
+// Attach adds the record's association i to the trace's pending instance p.
+func (s *Spool) Attach(p *Pending, r *Record, i int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.attachLocked(p, r, i)
+}
+
+func (s *Spool) attachLocked(p *Pending, r *Record, i int) {
 	if r.state[i] != unsettled {
 		return
 	}
 	r.state[i] = pending
-	id := r.assocs[i].ID
-	s.pending[id] = append(s.pending[id], assocRef{rec: r, idx: i})
+	if len(p.refs) == 0 {
+		s.pendingTraces++
+	}
+	p.refs = append(p.refs, assocRef{rec: r, idx: i})
 }
 
 // Inherit settles the record's association i by a decision made earlier for
@@ -396,37 +453,37 @@ func (s *Spool) Inherit(r *Record, i int, keep bool) {
 	s.settleLocked(r, i, keep)
 }
 
-// Decide settles every association of the trace's pending instance.
-func (s *Spool) Decide(id pcommon.TraceID, keep bool) {
+// Decide settles every association of the trace's pending instance p.
+func (s *Spool) Decide(p *Pending, id pcommon.TraceID, keep bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	kind := byte(frameDrop)
 	if keep {
 		kind = frameKeep
 	}
-	s.logBeyondWatermarkLocked(id, keep)
+	s.logBeyondWatermarkLocked(p, keep)
 	s.appendLocked(&frame{kind: kind, seq: s.wm, id: id})
 	s.memo.put(id, keep)
-	s.settlePendingLocked(id, keep)
+	s.settlePendingLocked(p, keep)
 }
 
-// Evict ends the trace's instance without a decision; its pending spans are
-// dropped, as the in-memory processor does when it removes a trace for
+// Evict ends the trace's instance p without a decision; its pending spans
+// are dropped, as the in-memory processor does when it removes a trace for
 // capacity, and a decision it still held is forgotten.
-func (s *Spool) Evict(id pcommon.TraceID) {
+func (s *Spool) Evict(p *Pending, id pcommon.TraceID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.logBeyondWatermarkLocked(id, false)
+	s.logBeyondWatermarkLocked(p, false)
 	s.appendLocked(&frame{kind: frameEvict, seq: s.wm, id: id})
 	s.memo.remove(id)
 	s.stats.Evicted++
-	s.settlePendingLocked(id, false)
+	s.settlePendingLocked(p, false)
 }
 
 // logBeyondWatermarkLocked logs the settlement of associations attached in
 // the record being processed, which replay does not attach by watermark.
-func (s *Spool) logBeyondWatermarkLocked(id pcommon.TraceID, keep bool) {
-	for _, ref := range s.pending[id] {
+func (s *Spool) logBeyondWatermarkLocked(p *Pending, keep bool) {
+	for _, ref := range p.refs {
 		if ref.rec.seq > s.wm {
 			s.appendLocked(&frame{kind: frameLate, seq: ref.rec.seq, idx: uint32(ref.idx), keep: keep})
 		}
@@ -454,7 +511,7 @@ func (s *Spool) dequeueLocked(r *Record) {
 	r.payload = nil
 	s.freeRoomLocked()
 	if len(s.unprocessed) > 0 {
-		s.pokeLocked()
+		s.poke()
 	}
 }
 
@@ -482,7 +539,7 @@ func (s *Spool) Stats() Stats {
 	st := s.stats
 	st.LiveRecords = len(s.records)
 	st.LiveSegments = len(s.segs)
-	st.PendingTraces = len(s.pending)
+	st.PendingTraces = s.pendingTraces
 	st.ReadyRecords = len(s.ready)
 	st.RetryingRecords = len(s.retryTimers)
 	st.UnprocessedRecords = len(s.unprocessed)
@@ -499,9 +556,13 @@ func (s *Spool) appendLocked(f *frame) {
 	}
 }
 
-func (s *Spool) settlePendingLocked(id pcommon.TraceID, keep bool) {
-	refs := s.pending[id]
-	delete(s.pending, id)
+func (s *Spool) settlePendingLocked(p *Pending, keep bool) {
+	refs := p.refs
+	if len(refs) == 0 {
+		return
+	}
+	p.refs = nil
+	s.pendingTraces--
 	for _, ref := range refs {
 		s.settleLocked(ref.rec, ref.idx, keep)
 	}

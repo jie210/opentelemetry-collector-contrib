@@ -63,6 +63,9 @@ type TraceData struct {
 	decisionTime  time.Time
 	deleteElement *list.Element
 	batchID       uint64
+	// spooled holds the associations of the spool's requests with the
+	// trace while it is undecided.
+	spooled spool.Pending
 }
 
 // DecisionHook is called when a sampling decision is made for a trace. When
@@ -311,6 +314,10 @@ type traceBatch struct {
 	// rec and idx locate the trace's association in the spooled request.
 	rec *spool.Record
 	idx int
+	// frag holds rss as the only ResourceSpans of a Traces, which the
+	// spool folds with pre.
+	frag ptrace.Traces
+	pre  sampling.Prepared
 }
 
 type newPolicyCmd struct {
@@ -683,8 +690,8 @@ func (tsp *tailSamplingSpanProcessor) waitForSpace(tickChan <-chan time.Time) {
 		tsp.logger.Error("deleteTraceQueue is empty, but we're waiting for space. This is a bug!")
 		return
 	}
-	if _, ok := tsp.idToTrace[front.Value.(pcommon.TraceID)]; ok && tsp.spool != nil {
-		tsp.spool.Evict(front.Value.(pcommon.TraceID))
+	if td, ok := tsp.idToTrace[front.Value.(pcommon.TraceID)]; ok && tsp.spool != nil {
+		tsp.spool.Evict(&td.spooled, front.Value.(pcommon.TraceID))
 	}
 	if !tsp.dropTrace(front.Value.(pcommon.TraceID), time.Now()) {
 		// Somehow the trace was already removed from idToTrace, but not the
@@ -870,7 +877,7 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 		c.trace.FinalDecision = samplingpolicy.Dropped
 		c.trace.PolicyName = p.name
 		if tsp.spool != nil {
-			tsp.spool.Decide(c.id, false)
+			tsp.spool.Decide(&c.trace.spooled, c.id, false)
 			c.trace.Folded = nil
 		}
 		tsp.releaseNotSampledTrace(c.id, c.trace)
@@ -892,7 +899,7 @@ func (tsp *tailSamplingSpanProcessor) samplingPolicyOnTick() bool {
 		c.trace.FinalThreshold = threshold
 		c.trace.PolicyName = policyName
 		if tsp.spool != nil {
-			tsp.spool.Decide(c.id, decision == samplingpolicy.Sampled)
+			tsp.spool.Decide(&c.trace.spooled, c.id, decision == samplingpolicy.Sampled)
 			c.trace.Folded = nil
 		}
 
